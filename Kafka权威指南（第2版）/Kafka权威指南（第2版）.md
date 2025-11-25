@@ -173,5 +173,147 @@ Kafka使用ZooKeeper保存broker、主题和分区的元数据。只有当消费
 
 # 第3章　Kafka生产者——向Kafka写入数据
 
-多样的应用场景意味着多样的需求：是否每条消息都很重要？是否允许丢失一小部分消息？是否可以接受偶尔出现重复消息？是否有严格的延迟和吞吐量需求？
+多样的应用场景意味着多样的需求：是否每条消息都很重要？是否允许丢失一小部分消息？是否可以接受偶尔出现重复消息？是否有严格的延迟和吞吐量需求？不同的应用场景直接影响如何使用和配置生产者API。
+
+先从创建一个ProducerRecord对象开始，其中需要包含目标主题和要发送的内容。另外，还可以指定键、分区、时间戳或标头。在发送ProducerRecord对象时，生产者需要先把键和值对象序列化成字节数组，这样才能在网络上传输。
+
+接下来，如果没有显式地指定分区，那么数据将被传给分区器。分区器通常会基于ProducerRecord对象的键选择一个分区。选好分区以后，生产者就知道该往哪个主题和分区发送这条消息了。紧接着，该消息会被添加到一个消息批次里，这个批次里的所有消息都将被发送给同一个主题和分区。有一个独立的线程负责把这些消息批次发送给目标broker。
+
+broker在收到这些消息时会返回一个响应。如果消息写入成功，就返回一个RecordMetaData对象，其中包含了主题和分区信息，以及消息在分区中的偏移量。如果消息写入失败，则会返回一个错误。生产者在收到错误之后会尝试重新发送消息，重试几次之后如果还是失败，则会放弃重试，并返回错误信息。
+
+## 3.2　创建Kafka生产者
+
+Kafka生产者有3个必须设置的属性。
+
+- key.serializer：broker的地址。可以由多个host:port组成，生产者用它们来建立初始的Kafka集群连接。它不需要包含所有的broker地址，因为生产者在建立初始连接之后可以从给定的broker那里找到其他broker的信息。不过还是建议至少提供两个broker地址，因为一旦其中一个停机，则生产者仍然可以连接到集群。
+
+- key.serializer：一个类名，用来序列化消息的键。broker希望接收到的消息的键和值都是字节数组。生产者可以把任意Java对象作为键和值发送给broker，但它需要知道如何把这些Java对象转换成字节数组。key.serializer必须被设置为一个实现了org.apache.kafka.common.serialization.Serializer接口的类，生产者会用这个类把键序列化成字节数组。Kafka客户端默认提供了ByteArraySerializer、StringSerializer和IntegerSerializer等，如果你只使用常见的几种Java对象类型，就没有必要实现自己的序列化器。需要注意的是，必须设置key.serializer这个属性，尽管你可能只需要将值发送给Kafka。如果只需要发送值，则可以将Void作为键的类型，然后将这个属性设置为VoidSerializer。
+
+- value.serializer：一个类名，用来序列化消息的值。与设置key.serializer属性一样，需要将value.serializer设置成可以序列化消息值对象的类。
+
+```java
+Properties kafkaProps = new Properties(); ➊
+kafkaProps.put("bootstrap.servers", "broker1:9092,broker2:9092");
+kafkaProps.put("key.serializer",
+    "org.apache.kafka.common.serialization.StringSerializer"); ➋
+kafkaProps.put("value.serializer",
+    "org.apache.kafka.common.serialization.StringSerializer");
+
+producer = new KafkaProducer<String, String>(kafkaProps); ➌
+```
+
+发送消息主要有以下3种方式。
+
+- 发送并忘记：把消息发送给服务器，但并不关心它是否成功送达。大多数情况下，消息可以成功送达，因为Kafka是高可用的，而且生产者有自动尝试重发的机制。但是，如果发生了不可重试的错误或超时，那么消息将会丢失，应用程序将不会收到任何信息或异常。
+
+- 同步发送：一般来说，生产者是异步的——我们调用send()方法发送消息，它会返回一个Future对象。可以调用get()方法等待Future完成，这样就可以在发送下一条消息之前知道当前消息是否发送成功。
+
+- 异步发送：调用send()方法，并指定一个回调函数，当服务器返回响应时，这个函数会被触发。
+
+```java
+ProducerRecord<String, String> record =
+    new ProducerRecord<>("CustomerCountry", "Precision Products",
+        "France"); ➊
+try {
+    producer.send(record); ➋
+} catch (Exception e) {
+    e.printStackTrace(); ➌
+}
+```
+
+```java
+ProducerRecord<String, String> record =
+    new ProducerRecord<>("CustomerCountry", "Precision Products", "France");
+try {
+    producer.send(record).get(); ➊
+} catch (Exception e) {
+    e.printStackTrace(); ➋
+}
+```
+
+```java
+private class DemoProducerCallback implements Callback { ➊
+    @Override
+    public void onCompletion(RecordMetadata recordMetadata, Exception e) {
+        if (e != null) {
+            e.printStackTrace(); ➋
+        }
+    }
+}
+
+ProducerRecord<String, String> record =
+    new ProducerRecord<>("CustomerCountry", "Biomedical Materials", "USA"); ➌
+producer.send(record, new DemoProducerCallback()); ➍
+```
+
+## 3.4　生产者配置
+
+### 3.4.1　client.id
+
+client.id是客户端标识符，它的值可以是任意字符串，broker用它来识别从客户端发送过来的消息。选择一个好的客户端标识符可以让故障诊断变得更容易些.
+
+### 3.4.2　acks
+
+acks指定了生产者在多少个分区副本收到消息的情况下才会认为消息写入成功。在默认情况下，Kafka会在首领副本收到消息后向客户端回应消息写入成功（Kafka 3.0预计会改变这个默认行为）​。这个参数对写入消息的持久性有重大影响，对于不同的场景，使用默认值可能不是最好的选择。
+
+- acks=0: 如果acks=0，则生产者不会等待任何来自broker的响应。也就是说，如果broker因为某些问题没有收到消息，那么生产者便无从得知，消息也就丢失了。不过，因为生产者不需要等待broker返回响应，所以它们能够以网络可支持的最大速度发送消息，从而达到很高的吞吐量。
+
+- acks=1: 如果acks=1，那么只要集群的首领副本收到消息，生产者就会收到消息成功写入的响应。如果消息无法到达首领副本（比如首领副本发生崩溃，新首领还未选举出来）​，那么生产者会收到一个错误响应。为了避免数据丢失，生产者会尝试重发消息。不过，在首领副本发生崩溃的情况下，如果消息还没有被复制到新的首领副本，则消息还是有可能丢失。
+
+- acks=all: 如果acks=all，那么只有当所有副本全部收到消息时，生产者才会收到消息成功写入的响应。这种模式是最安全的，它可以保证不止一个broker收到消息，就算有个别broker发生崩溃，整个集群仍然可以运行（第6章将讨论更多的细节）​。不过，它的延迟比acks=1高，因为生产者需要等待不止一个broker确认收到消息。
+
+### 3.4.3　消息传递时间
+
+从Kafka 2.1开始，我们将ProduceRecord的发送时间分成如下两个时间间隔，它们是被分开处理的。
+
+● 异步调用send()所花费的时间。在此期间，调用send()的线程将被阻塞。
+● 从异步调用send()返回到触发回调（不管是成功还是失败）的时间，也就是从ProduceRecord被放到批次中直到Kafka成功响应、出现不可恢复异常或发送超时的时间。
+
+- max.block.ms：这个参数用于控制在调用send()或通过partitionsFor()显式地请求元数据时生产者可以发生阻塞的时间。当生产者的发送缓冲区被填满或元数据不可用时，这些方法就可能发生阻塞。当达到max.block.ms配置的时间时，就会抛出一个超时异常。
+
+- delivery.timeout.ms这个参数用于控制从消息准备好发送（send()方法成功返回并将消息放入批次中）到broker响应或客户端放弃发送（包括重试）所花费的时间。如图3-2所示，这个时间应该大于linger.ms和request.timeout.ms。如果配置的时间不满足这一点，则会抛出异常。通常，成功发送消息的速度要比delivery.timeout.ms快得多。一般建议这个时间大于broker重新选举的时间30s，建议可以配置为120。
+
+- request.timeout.ms这个参数用于控制生产者在发送消息时等待服务器响应的时间。需要注意的是，这是指生产者在放弃之前等待每个请求的时间，不包括重试、发送之前所花费的时间等。如果设置的值已触及，但服务器没有响应，那么生产者将重试发送，或者执行回调，并传给它一个TimeoutException。
+
+- retries 和retry.backoff.ms当生产者收到来自服务器的错误消息时，这个错误有可能是暂时的（例如，一个分区没有首领）​。在这种情况下，retries参数可用于控制生产者在放弃发送并向客户端宣告失败之前可以重试多少次。在默认情况下，重试时间间隔是100毫秒，但可以通过retry.backoff.ms参数来控制重试时间间隔。
+
+生产者并不会重试所有的错误。有些错误不是暂时的，生产者就不会进行重试（例如，​“消息太大”错误）​。通常，对于可重试的错误，生产者会自动进行重试，所以不需要在应用程序中处理重试逻辑。你要做的是集中精力处理不可重试的错误或者当重试次数达到上限时的情况。
+
+### 3.4.4　linger.ms
+
+这个参数指定了生产者在发送消息批次之前等待更多消息加入批次的时间。生产者会在批次被填满或等待时间达到linger.ms时把消息批次发送出去。在默认情况下，只要有可用的发送者线程，生产者都会直接把批次发送出去，就算批次中只有一条消息。把linger.ms设置成比0大的数，可以让生产者在将批次发送给服务器之前等待一会儿，以使更多的消息加入批次中。虽然这样会增加一点儿延迟，但也极大地提升了吞吐量。这是因为一次性发送的消息越多，每条消息的开销就越小，如果启用了压缩，则计算量也更少了。
+
+### 3.4.5　buffer.memory
+
+这个参数用来设置生产者要发送给服务器的消息的内存缓冲区大小。如果应用程序调用send()方法的速度超过生产者将消息发送给服务器的速度，那么生产者的缓冲空间可能会被耗尽，后续的send()方法调用会等待内存空间被释放，如果在max.block.ms之后还没有可用空间，就抛出异常。需要注意的是，这个异常与其他异常不一样，它是send()方法而不是Future对象抛出来的。
+
+### 3.4.6　compression.type
+
+在默认情况下，生产者发送的消息是未经压缩的。这个参数可以被设置为snappy、gzip、lz4或zstd，这指定了消息被发送给broker之前使用哪一种压缩算法。snappy压缩算法由谷歌发明，虽然占用较少的CPU时间，但能提供较好的性能和相当可观的压缩比。如果同时有性能和网络带宽方面的考虑，那么可以使用这种算法。gzip压缩算法通常会占用较多的CPU时间，但提供了更高的压缩比。如果网络带宽比较有限，则可以使用这种算法。使用压缩可以降低网络传输和存储开销，而这些往往是向Kafka发送消息的瓶颈所在。
+
+### 3.4.7　batch.size
+
+当有多条消息被发送给同一个分区时，生产者会把它们放在同一个批次里。这个参数指定了一个批次可以使用的内存大小。需要注意的是，该参数是按照字节数而不是消息条数来计算的。当批次被填满时，批次里所有的消息都将被发送出去。但是生产者并不一定都会等到批次被填满时才将其发送出去。那些未填满的批次，甚至只包含一条消息的批次也有可能被发送出去。所以，就算把批次大小设置得很大，也不会导致延迟，只是会占用更多的内存而已。但如果把批次大小设置得太小，则会增加一些额外的开销，因为生产者需要更频繁地发送消息。
+
+### 3.4.8　max.in.flight.requests.per.connection
+
+这个参数指定了生产者在收到服务器响应之前可以发送多少个消息批次。它的值越大，占用的内存就越多，不过吞吐量也会得到提升。在单数据中心环境中，该参数被设置为2时可以获得最佳的吞吐量，但使用默认值5也可以获得差不多的性能。
+
+Kafka可以保证同一个分区中的消息是有序的。也就是说，如果生产者按照一定的顺序发送消息，那么broker会按照这个顺序把它们写入分区，消费者也会按照同样的顺序读取它们。在某些情况下，顺序是非常重要的。
+
+### 3.4.9　max.request.size
+
+这个参数用于控制生产者发送的请求的大小。它限制了可发送的单条最大消息的大小和单个请求的消息总量的大小。另外，broker对可接收的最大消息也有限制(message.max.bytes)，其两边的配置最好是匹配的，以免生产者发送的消息被broker拒绝。
+
+### 3.4.10　receive.buffer.bytes和send.buffer.bytes
+
+这两个参数分别指定了TCP socket接收和发送数据包的缓冲区大小。如果它们被设为–1，就使用操作系统默认值。如果生产者或消费者与broker位于不同的数据中心，则可以适当加大它们的值，因为跨数据中心网络的延迟一般都比较高，而带宽又比较低。
+
+### 3.4.11　enable.idempotence
+
+为了避免broker出现重复的消息，可以将enable.idempotence设置为true。当幂等生产者被启用时，生产者将给发送的每一条消息都加上一个序列号。如果broker收到具有相同序列号的消息，那么它就会拒绝第二个副本，而生产者则会收到DuplicateSequenceException，这个异常对生产者来说是无害的。
+
+如果要启用幂等性，那么max.in.flight.requests.per.connection应小于或等于5、retries应大于0，并且acks被设置为all。如果设置了不恰当的值，则会抛出ConfigException异常。
+
+
 
