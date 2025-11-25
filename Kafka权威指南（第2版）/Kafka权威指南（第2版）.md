@@ -315,5 +315,74 @@ Kafka可以保证同一个分区中的消息是有序的。也就是说，如果
 
 如果要启用幂等性，那么max.in.flight.requests.per.connection应小于或等于5、retries应大于0，并且acks被设置为all。如果设置了不恰当的值，则会抛出ConfigException异常。
 
+## 3.5　序列化器
+
+### 3.5.1　自定义序列化器
+
+如果要发送给Kafka的对象不是简单的字符串或整型，则既可以用通用的序列化框架（比如Avro、Thrift或Protobuf）来创建消息，也可以使用自定义序列化器。强烈建议使用通用的序列化框架。
+
+## 3.6　分区
+
+在上面的例子中，ProducerRecord对象包含了主题名称、记录的键和值。Kafka消息就是一个个的键–值对，ProducerRecord对象可以只包含主题名称和值，键默认情况下是null。不过，大多数应用程序还是会用键来发送消息。键有两种用途：一是作为消息的附加信息与消息保存在一起，二是用来确定消息应该被写入主题的哪个分区（键在压缩主题中也扮演了重要角色），具有相同键的消息将被写入同一个分区。如果一个进程只从主题的某些分区读取数据，那么具有相同键的所有记录都会被这个进程读取。
+
+```java
+ProducerRecord<String, String> record =
+    new ProducerRecord<>("CustomerCountry", "Laboratory Equipment", "USA");
+```
+
+```java
+ProducerRecord<String, String> record =
+    new ProducerRecord<>("CustomerCountry", "USA"); //这里的键将被设置为null。
+```
+
+如果键为null，并且使用了默认的分区器，那么记录将被随机发送给主题的分区。分区器使用轮询调度(round-robin)算法将消息均衡地分布到各个分区中。从Kafka 2.4开始，在处理键为null的记录时，默认分区器使用的轮询调度算法具备了黏性。也就是说，在切换到下一个分区之前，它会将同一个批次的消息全部写入当前分区。这样就可以使用更少的请求发送相同数量的消息，既降低了延迟，又减少了broker占用CPU的时间。
+
+如果键不为空且使用了默认的分区器，那么Kafka会对键进行哈希（使用Kafka自己的哈希算法，即使升级Java版本，哈希值也不会发生变化）​，然后根据哈希值把消息映射到特定的分区。这里的关键在于同一个键总是被映射到同一个分区，所以在进行映射时，会用到主题所有的分区，而不只是可用的分区。这也意味着，如果在写入数据时目标分区不可用，那么就会出错。不过这种情况很少发生。
+
+除了默认的分区器，Kafka客户端还提供了RoundRobinPartitioner和UniformStickyPartitioner。在消息包含键的情况下，可以用它们来实现随机分区分配和黏性随机分区分配。也可以用UniformStickyPartitioner将负载均衡地分布到所有分区。
+
+如果使用了默认的分区器，那么只有在不改变主题分区数量的情况下键与分区之间的映射才能保持一致。
+
+除了哈希分区，有时也需要使用不一样的分区策略。假设你是B2B供应商，你有一个大客户，它是手持设备Banana的制造商。你的日常交易中有10%以上的交易与这个客户有关。如果使用默认的哈希分区算法，那么与Banana相关的记录就会和其他客户的记录一起被分配给相同的分区，导致这个分区比其他分区大很多。服务器可能会出现存储空间不足、请求处理缓慢等问题。因此，需要给Banana分配单独的分区，然后使用哈希分区算法将其他记录分配给其他分区。
+
+```java
+import org.apache.kafka.clients.producer.Partitioner;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.record.InvalidRecordException;
+import org.apache.kafka.common.utils.Utils;
+
+public class BananaPartitioner implements Partitioner {
+
+    public void configure(Map<String, ?> configs) {} ➊
+
+    public int partition(String topic, Object key, byte[] keyBytes,
+                         Object value, byte[] valueBytes,
+                         Cluster cluster) {
+        List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
+        int numPartitions = partitions.size();
+
+        if ((keyBytes == null) || (!(key instanceOf String))) ➋
+            throw new InvalidRecordException("We expect all messages "+
+                "to have customer name as key");
+
+        if (((String) key).equals("Banana"))
+            return numPartitions - 1; // Banana的记录总是被分配到最后一个分区
+
+        // 其他记录被哈希到其他分区
+        return Math.abs(Utils.murmur2(keyBytes)) % (numPartitions - 1);
+    }
+
+    public void close() {}
+}
+```
+
+## 3.7　标头
+
+
+
+
+
+
 
 
