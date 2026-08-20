@@ -2414,3 +2414,1368 @@ Kafka服务器和客户端的设计、开发、测试以及调优都以单个数
 
 ![avatar](img/24.png)
 
+这种架构的主要好处在于，它可以为就近用户提供速度更快的服务，具有性能方面的优势，而且不会因为数据可用性问题（在星型架构中就有这种问题）做出功能方面的牺牲。还有一个好处是冗余和弹性。因为每个数据中心都具备完整的功能，所以一旦一个数据中心发生故障，则可以把用户重定向到另一个数据中心。这种故障转移只涉及网络重定向，是一种最简单也最透明的故障转移方案。这种架构的主要问题在于，如何在多个数据中心进行异步读写时避免冲突。比如，在镜像数据时如何确保同一条消息不会被无止境地来回镜像？更重要的是，保证跨数据中心的数据一致性会变得更加困难。以下是可能遇到的问题。
+
+● 如果用户向一个数据中心发送数据，并从另一个数据中心读取数据，那么在用户读取数据之前，他发送的数据有可能还没有被镜像到那个数据中心。对用户来说，这就好比把一本书加到购物车里，但是当他点开购物车时，书不在里面。因此，在使用这种架构时，开发人员经常会将用户“黏”在同一个数据中心里，确保用户在大多数情况下使用的是同一个集群（除非他们从远程连接到另一个集群或那个数据中心不可用）​。
+
+● 一个用户在一个数据中心订购了图书A，另一个数据中心几乎在同一时间收到了这个用户订购图书B的订单，在经过数据镜像之后，两个数据中心都有了这两个事件，也可以说两个数据中心都出现了两个冲突事件。应用程序需要知道如何处理这种情况。是否应该从中挑选一个作为“正确”的事件呢？如果是，那么就需要在两个数据中心之间定义好规则，让应用程序知道哪个事件才是正确的。或者，可以把两个事件都当成正确的事件，将两本书都发给用户，然后设立专门的部门来处理退货问题？亚马逊曾经用这种方式来处理冲突，但对券商来说，这种方案是行不通的。如何最小化和处理冲突要视具体情况而定。总而言之，如果使用了这种架构，则必然会遇到冲突，因此要想办法解决它们。
+
+如果能够很好地处理多个数据中心在进行异步读写时发生冲突的问题，那么强烈建议使用这种架构。这种架构是我们所知道的最具伸缩性、弹性、灵活性和成本优势的解决方案。所以，它值得我们投入精力去寻找。
+
+另外，还要避免循环镜像，相同的事件不能无止境地在两个数据中心之间来回镜像。对于每一个“逻辑主题”​，可以在每个数据中心里分别为它创建一个单独的主题，并确保不要从远程数据中心复制同名的主题。例如，对于逻辑主题users，我们在一个数据中心里为其创建SF.users主题，在另一个数据中心里为其创建NYC.users主题。镜像进程会将SF的SF.users镜像到NYC，将NYC的NYC.users镜像到SF。这样一来，每一个事件只会被镜像一次。不过，在经过镜像之后，每个数据中心里都会有SF.users和NYC.users这两个主题，也就是说，每个数据中心将拥有所有的用户数据。消费者如果要读取所有用户的数据，就需要以 *.users的方式订阅主题。也可以把这种方式理解为数据中心的命名空间，比如在这个例子中，NYC和SF就是命名空间。一些镜像工具，比如MirrorMaker，就是基于类似的命名空间机制来防止循环镜像。
+
+### 10.2.4　主备架构
+
+有时候，我们使用多个集群只是为了达到灾备的目的。你可能在同一个数据中心安装了两个集群，平常只使用其中一个，第二个集群（几乎）包含了与第一个集群相同的数据，当第一个集群不可用时，就可以使用第二个集群。这是一种合规性需求，业务不一定会将其纳入规划范畴，但还是有必要为其做好充分的准备。
+
+![avatar](img/25.png)
+
+这种架构的好处是易于实现，而且可以被应用于任何一种场景中。你只需要安装第二个集群，并使用镜像进程将第一个集群的数据完全镜像到第二个集群中，不需要操心如何访问数据、如何处理冲突，也不需要担心它会带来额外的架构复杂性。
+
+这种架构的不足在于，它浪费了一个集群。Kafka集群的故障转移比我们想象的要难得多。目前，要实现完全不丢失数据或无重复数据的Kafka集群故障转移是不可能的，更为常见的情况是既丢失数据，又出现重复数据。我们只能尽量减少这些问题的发生，但无法完全避免。
+
+不管选择哪一种故障转移方案，SRE团队都必须定期进行验证。今天能够正常运行的计划，在系统升级之后可能就无法正常运行了，或者现有的工具将无法满足新场景的需求。每季度进行一次故障转移验证是最低限度的要求，一个高效的SRE团队会更频繁地进行故障转移验证。
+
+__1.灾难恢复计划__
+
+一个是恢复时间目标(recovery time objective, RTO)，它表示灾难发生后恢复所有服务需要的最长时间。另一个是恢复点目标(recovery point objective, RPO)，它表示灾难发生后可能发生数据丢失的最长时间。RTO越低，就越要避免采用人工操作流程，因为只有自动化故障转移才能实现非常低的RTO。低RPO需要低延迟的实时镜像，如果要求RPO为零，则需要进行同步复制。
+
+__2.没有故障转移计划导致的数据丢失和不一致性__
+
+如果你的Kafka集群每秒处理100万条消息，主集群和灾备集群之间有5毫秒的延迟，那么在最好的情况下，灾备集群每秒会落后5000条消息。所以，如果没有故障转移计划，那么就要承担潜在的数据丢失风险。如果有故障转移计划，则可以先停止主集群，等待镜像进程将剩余数据镜像完毕，然后再切换到灾备集群，这样可以避免数据丢失。
+
+如果发生了非计划内的故障转移，则可能会丢失数千条消息。需要注意的是，目前镜像解决方案还不支持事务，也就是说，如果多个主题（比如保存销售数据的主题和保存产品数据的主题）之间有相关性，那么在故障转移过程中，有些数据可能可以及时到达灾备集群，有些则不能。在切换到灾备集群之后，应用程序需要知道如何处理没有相关销售信息的产品数据。
+
+__3.故障转移之后的起始偏移量__
+
+- 偏移量自动重置: Kafka消费者有一个配置参数，用于指定在没有前一个提交偏移量的情况下该作何处理。消费者要么从分区的起始位置开始读取数据，要么从分区的末尾开始读取。如果你的灾备计划里没有镜像偏移量，那么就需要从上述两个选项中选择一个。要么从头开始读取数据，并处理大量的重复数据，要么直接跳到末尾，放弃一些数据（希望不会太多）​。如果重复处理数据或者丢失一些数据不是大问题，那么这种方案就是目前为止最为简单的。一般来说，在故障转移之后直接从主题末尾开始读取数据的方式更为常见。
+
+- 复制偏移量主题: 如果你使用的是0.9.0及以上版本的Kafka消费者，那么它会把偏移量提交到一个叫作 __consumer_offsets的主题上。如果你将这个主题镜像到了灾备集群，那么当消费者开始读取灾备集群时，就可以获取到原先的偏移量，并从这个位置开始处理数据。这看起来很简单，但仍然有很多需要注意的地方。第一，我们并不能保证主集群中的偏移量与灾备集群中的偏移量是完全匹配的。假设主集群中的数据只保留3天，但你在主题创建好一星期之后才开始镜像数据。主集群中第一个可用偏移量可能是57 000 000（前4天的旧数据已经被删除了）​，而灾备集群中的第一个偏移量是0。当消费者尝试从57 000 003位置（因为这是它要读取的下一条消息）开始读取数据时，就会失败。第二，就算在主题创建之后立即镜像数据，并且主集群和灾备集群的偏移量都从0开始，当生产者需要重试发送消息时仍然会造成偏移量偏离。第三，就算偏移量被完美地保留下来，因为主集群和灾备集群之间存在延迟以及目前的镜像方案不支持事务，消费者提交的偏移量仍有可能在记录之前或者之后到达。在发生故障转移之后，消费者可能会找不到与偏移量匹配的记录，或者灾备集群中的偏移量会比主集群中的偏移量小.在这些情况下，需要接受一定程度的数据重复。当灾备集群中的偏移量比主集群中的小，或者因生产者进行重试而导致灾备集群中的偏移量比主集群中的大时，都会造成数据重复
+
+- 基于时间的故障转移:从Kafka 0.10.0开始，每条消息里都包含了一个时间戳——消息发送给Kafka的时间。从Kafka 0.10.1.0开始，broker提供了一个索引和可根据时间戳查找偏移量的API。如果发生了故障转移，而你知道故障是从凌晨4:05开始的，那么就可以让消费者从4:03的位置开始处理数据。虽然这两分钟时间差内会存在一些重复数据，但这种方式仍然比其他方案要好得多，而且也很容易向其他人解释：​“我们将从凌晨4:03的位置开始处理数据”要比“我们从一个不知道是不是最新的位置开始处理数据”要好得多。所以，这是一种更好的折中。一种方式是在应用程序中完成这件事情。我们为用户提供一个配置参数，用于指定从什么时间点开始处理数据。如果用户指定了时间，那么应用程序就可以通过新API获取指定时间戳对应的偏移量，然后从这个位置开始处理数据。如果应用程序一开始就是这么设计的，那么使用这种方案就再好不过了。但如果不是呢？Kafka提供了kafka-consumer-groups工具，我们可以用它基于一些参数来重置偏移量，包括在Kafka 0.11.0中引入的基于时间戳的偏移量重置。在使用这个工具时，需要先停止消费者群组，等工具运行完毕之后再立即启动。例如，下面的命令会将某个消费者群组订阅的所有主题的偏移量都重置到指定的时间。
+
+```shell
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --resetoffsets
+--all-topics --group my-group --to-datetime
+2021-03-31T04:03:00.000 --execute
+```
+
+- 偏移量映射: 镜像偏移量主题的一个最大问题在于主集群和灾备集群的偏移量会发生偏离。在过去，一些组织会选择使用外部数据存储（如ApacheCassandra）来保存集群之间的偏移量映射关系。每当一个事件被发送 到灾备集群时，镜像工具会将两个集群的偏移量都发送到外部存储。现在的镜像解决方案（包括MirrorMaker）会使用Kafka主题来保存偏移量映射关系。当两个集群的偏移量差值发生变化时，就更新映射关系。如果主集群的偏移量495被映射到灾备集群的500，就在外部存储上记录(495,500)，或者把这个映射写到映射主题上。如果之后因为消息重复导致差值发生变化，偏移量596被映射为600，就记录新的映射(569,600)。没有必要保留495和596之间的所有偏移量映射，我们假设差值都是一样的，所以主集群的偏移量550会被映射到灾备集群的555。如果发生了故障转移，就使用主集群与灾备集群的偏移量映射，而不是时间戳（通常会有点儿不准确）与偏移量的映射。我们会通过之前介绍的两种技术手段之一强制消费者使用映射中的偏移量。
+
+__4.故障转移之后__
+
+假设故障转移进行得很顺利，灾备集群也运行得很正常，现在需要对主集群做一些改动，把它变成灾备集群。
+
+● 怎么知道该从哪里开始镜像呢？我们需要解决与镜像应用程序消费者所面临问题同样的问题。而且不要忘了，所有的解决方案都有可能导致数据丢失或重复，或两者兼有。
+
+● 另外，正如之前所讨论的那样，旧主集群中可能有一些数据没有被镜像到新主集群中，如果这个时候开始镜像新主集群的数据，那么历史遗留数据会继续留在旧主集群中，导致两个集群的数据不一致。
+
+因此，如果要保证数据的一致性和顺序，最简单的解决方案是清理旧主集群，删掉所有数据和偏移量，然后从新主集群中把数据镜像回来。这样可以获得与新主集群一致的数据状态。
+
+__5.关于集群发现__
+
+在设计灾备集群时，需要考虑的一个很重要的问题是在发生故障转移之后，应用程序如何与灾备集群通信。如果把主集群的主机名硬编码在生产者和消费者的配置文件中，就会很麻烦。为简单起见，大多数组织使用了DNS，并将其指向主集群，一旦发生紧急情况，则可以将其指向灾备集群。这些服务发现工具（DNS或其他）不需要包含所有broker的信息，只要Kafka客户端能够连接到其中一个broker，就可以获取整个集群的元数据，并发现集群中的其他broker。一般来说，提供3个broker的信息就可以了。不管使用哪种服务发现工具，在大多数情况下需要重启消费者，这样才能找到新的偏移量，并继续读取数据。对于为降低RTO而使用自动故障转移的场景，需要将故障转移处理逻辑放在客户端应用程序中。
+
+### 10.2.5　延展集群
+
+在主备架构中，当Kafka主集群发生失效时，可以将应用程序重定向到另一个集群，以保证业务的正常运行。而当整个数据中心发生故障时，延展集群(stretch cluster)可以保证Kafka集群仍然可用。延展集群是指跨多个数据中心的Kafka集群。
+
+首先，延展集群并非多个集群，而是单个集群，因此不需要使用镜像进程。延展集群使用Kafka内置的复制机制来保持broker副本的同步。这里可以使用同步复制。生产者通常会在消息成功写入Kafka之后收到确认。在延展集群中，也可以配置类似的参数，在消息被写入两个数据中心的broker之后发送确认。这还包括使用机架信息确保每个分区在其他数据中心都有相应的副本，并配置min.insync.replicas和acks=all，以确保每次写入消息时都可以收到来自至少两个数据中心的确认。从Kafka 2.4.0开始，消费者可以基于机架信息从最近的副本获取数据。broker会检查自己的机架信息与消费者的机架信息，以便找到最新的本地副本，如果本地副本不可用，就从首领副本读取。从本地数据中心的跟随者副本读取数据可以提高吞吐量、降低延迟和成本，因为跨数据中心的流量减少了。
+
+同步复制是这种架构的最大优势。有些类型的业务要求灾备站点与主站点保持100%的同步。这是一种合规性需求，适用于公司内的任何一种数据存储，包括Kafka。这种架构还有一个优势，即两个数据中心及集群内的所有broker都发挥了作用，不会浪费资源。
+
+这种架构的不足之处是它所能应对的灾难类型是有限的。它只能应对数据中心故障，但无法应对应用程序或者Kafka故障。运维复杂性是它的另一个不足之处，它所需要的物理基础设施并不是所有公司都能承担得起的。
+
+之所以是3个数据中心，主要是因为ZooKeeper要求集群的节点个数是奇数，并且只有当大多数节点可用时，整个集群才可用。如果只有两个数据中心，并且ZooKeeper的节点是奇数个，那么其中一个数据中心将包含大多数节点，这就意味着如果这个数据中心不可用，那么ZooKeeper和Kafka也不可用。如果有3个数据中心，那么在分配节点时，可以做到每个数据中心都不会包含大多数节点。如果其中一个数据中心不可用，那么其他两个数据中心里还有大多数节点，此时ZooKeeper和Kafka仍然可用。
+
+一种比较流行的延展集群模型是2.5数据中心架构，即两个数据中心里都安装了Kafka和ZooKeeper，然后再在另外“半”个数据中心里安装一个ZooKeeper节点，当其中一个数据中心发生故障时，它可以提供仲裁。
+
+## 10.3　MirrorMaker
+
+Kafka提供了一个叫作MirrorMaker的工具，用于在两个数据中心之间镜像数据。
+
+
+# 第11章　保护Kafka
+
+# 第12章　管理Kafka
+
+管理Kafka集群意味着需要使用额外的工具对主题、配置等做出修改。Kafka提供了一些命令行工具，以用于对集群做出变更。这些工具使用Java类实现，Kafka提供了一些脚本来调用它们。不过，这些工具只提供了基本的功能，无法完成复杂的操作，难以被用于管理大规模的集群。本章只介绍Kafka项目提供的基础工具。Kafka社区也开发了很多高级工具，虽然不属于Kafka核心项目，但是可以在Kafka网站上找到它们。
+
+## 12.1　主题操作
+
+可以用kafka-topics.sh执行大部分与主题相关的操作。可以用它创建、修改、删除和查看主题。
+
+本章假设所有工具都位于 /usr/local/kafka/bin/ 目录。本节示例中的命令都假设这个目录为当前工作目录，或者这个目录已经被添加到 $PATH环境变量中。
+
+## 12.1.1　创建新主题
+
+--topic想要创建的主题的名字。
+
+--replication-factor主题的副本数量。
+
+--partitions主题的分区数量。
+
+主题的名字可以包含字母数字字符、下划线、破折号和点号，但不建议使用点号。Kafka的内部指标会将点号转成下划线。另外，避免使用双下划线作为主题名字的前缀。根据约定，Kafka内部主题的名字以双下划线开头。
+
+创建一个新主题非常简单，只需像下面这样运行kafka-topics.sh。
+
+```shell
+# kafka-topics.sh --bootstrap-server <connection-string>:<port> --create --
+topic <string>
+--replication-factor <integer> --partitions <integer>
+#
+```
+
+```shell
+# kafka-topics.sh --bootstrap-server localhost:9092 --create
+--topic my-topic --replication-factor 2 --partitions 8
+Created topic "my-topic".
+#
+```
+
+在自动化脚本中调用kafka-topics.sh时，可以指定 --if-not-exists选项，这样即使要创建的主题已经存在也不会抛出异常。虽然Kafka为 --alter命令提供了 --if-exists参数，但不建议使用它。这是因为如果指定了这个选项，并且要修改的主题不存在，那么--alter命令就不会返回任何错误，从而掩盖了本应创建这个不存在的主题的错误。
+
+### 12.1.2　列出集群中的所有主题
+
+可以用 --list命令列出集群中的所有主题。每个主题占用一行输出，主题之间没有特定的顺序
+
+```shell
+# kafka-topics.sh --bootstrap-server localhost:9092 --list
+__consumer_offsets
+my-topic
+other-topic
+#
+```
+### 12.1.3　列出主题详情
+
+还可以获取一个或多个主题的详细信息。详细信息里包含了分区数量、主题的覆盖配置以及每个分区的副本清单。也可以指定 --topic参数，只列出指定主题的详细信息。
+
+ISR是In-Sync Replicas（同步副本集）的缩写。ISR 指的是与 Leader 副本保持同步的 Follower 副本集合。只有处于 ISR 中的副本才有资格在 Leader 故障时被选举为新的 Leader，从而保证数据的一致性和高可用性。
+
+```shell
+# kafka-topics.sh --boostrap-server localhost:9092 --describe --topic my-topic
+Topic: my-topic PartitionCount: 8       ReplicationFactor: 2    Configs: seg
+ment.bytes=1073741824
+        Topic: my-topic Partition: 0    Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 1    Leader: 0       Replicas: 0,1   Isr: 0,1
+        Topic: my-topic Partition: 2    Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 3    Leader: 0       Replicas: 0,1   Isr: 0,1
+        Topic: my-topic Partition: 4    Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 5    Leader: 0       Replicas: 0,1   Isr: 0,1
+        Topic: my-topic Partition: 6    Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 7    Leader: 0       Replicas: 0,1   Isr: 0,1
+#
+```
+
+__--topics-with-overrides__
+
+这个参数只会列出配置参数与集群默认值不同的主题。
+
+__--exclude-internal__
+
+这是之前提到的参数，它可以将所有名字以双下划线开头的主题排除。下面的参数可用于找出有问题的分区。
+
+__--under-replicated-partitions__
+
+这个参数可以找出一个或多个副本与首领不同步的分区。这并不一定是坏事，因为集群维护、部署和再均衡都会导致分区副本不同步，但还是要注意一下。
+
+__--at-min-isr-partitions__
+
+这个参数可以找出副本数量（包括首领在内）与配置的最少同步副本(ISR)数完全匹配的分区。这些主题对生产者客户端或消费者客户端来说仍然可用，但已无冗余，有会变得不可用的风险。
+
+__--under-min-isr-partitions__
+
+这个参数可以找出ISR数低于配置的最小值的分区。这些分区实际上处于只读模式，不能向其写入数据。
+
+__--unavailable-partitions__
+
+这个参数可以找出所有没有首领的分区。这种情况很严重，说明分区已离线，对生产者客户端或消费者客户端来说已经是不可用的。
+
+下面是一个找出具有最少ISR数的主题的例子。在这个例子中，主题的最少ISR数为1，复制系数(RF)为2。主机0在线，主机1停机维护。
+
+```shell
+# kafka-topics.sh --bootstrap-server localhost:9092 --describe --at-min-isrpartitions
+        Topic: my-topic Partition: 0    Leader: 0       Replicas: 0,1   Isr: 0
+        Topic: my-topic Partition: 1    Leader: 0       Replicas: 0,1   Isr: 0
+        Topic: my-topic Partition: 2    Leader: 0       Replicas: 0,1   Isr: 0
+        Topic: my-topic Partition: 3    Leader: 0       Replicas: 0,1   Isr: 0
+        Topic: my-topic Partition: 4    Leader: 0       Replicas: 0,1   Isr: 0
+        Topic: my-topic Partition: 5    Leader: 0       Replicas: 0,1   Isr: 0
+        Topic: my-topic Partition: 6    Leader: 0       Replicas: 0,1   Isr: 0
+        Topic: my-topic Partition: 7    Leader: 0       Replicas: 0,1   Isr: 0
+#
+```
+
+### 12.1.4　增加分区
+
+有时候需要增加主题的分区数量。分区是主题进行伸缩和复制的基础，增加分区通常是为了通过降低单个分区的吞吐量来扩展主题容量。如果要在单个消费者群组内运行更多的消费者，则分区数量也需要相应增加，因为一个分区只能被同一个群组里的一个消费者读取。
+
+下面的例子会先使用 --alter命令将“my-topic”主题的分区数量增加到16，然后再验证是否修改成功。
+
+```shell
+# kafka-topics.sh --bootstrap-server localhost:9092
+--alter --topic my-topic --partitions 16
+
+# kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic my-topic
+Topic: my-topic PartitionCount: 16      ReplicationFactor: 2    Configs: seg
+ment.bytes=1073741824
+        Topic: my-topic Partition: 0    Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 1    Leader: 0       Replicas: 0,1   Isr: 0,1
+        Topic: my-topic Partition: 2    Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 3    Leader: 0       Replicas: 0,1   Isr: 0,1
+        Topic: my-topic Partition: 4    Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 5    Leader: 0       Replicas: 0,1   Isr: 0,1
+        Topic: my-topic Partition: 6    Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 7    Leader: 0       Replicas: 0,1   Isr: 0,1
+        Topic: my-topic Partition: 8    Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 9    Leader: 0       Replicas: 0,1   Isr: 0,1
+        Topic: my-topic Partition: 10   Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 11   Leader: 0       Replicas: 0,1   Isr: 0,1
+        Topic: my-topic Partition: 12   Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 13   Leader: 0       Replicas: 0,1   Isr: 0,1
+        Topic: my-topic Partition: 14   Leader: 1       Replicas: 1,0   Isr: 1,0
+        Topic: my-topic Partition: 15   Leader: 0       Replicas: 0,1   Isr: 0,1
+#
+```
+从消费者角度来看，为包含键的主题添加分区是很困难的。这是因为如果改变了分区数量，那么键与分区之间的映射也会发生变化。因此，对于包含键的主题，建议一开始就设置好分区数量，避免后续对其进行调整。
+
+### 12.1.5　减少分区
+
+我们不可能减少主题的分区数量。如果删除了主题的一个分区，那么这个分区里的数据也会被删除，导致客户端看到的数据不一致。此外，将数据重新分布到其余的分区中是非常困难的，即使能够做到，也无法保证消息的顺序。如果要减少分区数量，则建议删除整个主题并重新创建，或者（如果不能删除的话）创建一个新主题（比如叫作“my-topic-v2”​）​，并将所有流量重定向到新主题。
+
+### 12.1.6　删除主题
+
+即使一个主题里没有任何消息，仍然会占用集群资源（比如磁盘空间、文件句柄和内存）​。控制器中也有一些垃圾元数据，这些垃圾元数据在大型集群中会影响集群性能。如果一个主题不再被使用，那么可以将其删除，以便释放出被占用的资源。要删除主题，broker的delete.topic.enable参数必须被设置为true，如果设置为false，那么删除主题的请求将被忽略，也就无法删除主题。
+
+删除主题是异步操作，也就是说，要删除的主题将被打上删除标记，但可能不会立即被删除，具体取决于数据量和清理策略。控制器会尽快通知broker有挂起的删除操作（在现有的控制器任务完成之后）​，然后broker会让主题的元数据失效，并从磁盘上删除相应的文件。由于控制器删除主题的方式受到了限制，建议不要一次性删除多个主题，而且在开始删除其他主题之前要给当前的删除操作留有足够的时间。
+
+删除一个主题也就删除了主题的所有数据。这是一个不可逆操作，所以在删除时要十分小心。
+
+下面的例子会使用 --delete命令删除“my-topic”主题。
+
+```shell
+# kafka-topics.sh --bootstrap-server localhost:9092
+--delete --topic my-topic
+
+Note: This will have no impact if delete.topic.enable is not set
+to true.
+#
+```
+## 12.2　消费者群组
+
+消费者群组用于协调消费者从多个主题或单个主题的多个分区读取消息。可以用kafka-consumer-groups.sh来管理和查看消费者群组信息，比如列出所有消费者群组、查看特定的消费者群组、删除多个或特定的消费者群组以及重置消费者群组偏移量。
+
+### 12.2.1　列出并描述消费者群组信息
+
+要列出消费者群组，需要指定 --bootstrap-server参数和 --list参数。使用kafka-consumer-groups.sh创建的临时消费者将以console-consumer-<generated_id>的格式列出来。
+
+```shell
+# kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list
+console-consumer-95554
+console-consumer-9581
+my-consumer
+#
+```
+
+如果用 --describe代替 --list，并用 --group指定特定的群组，就可以获取这个群组的详细信息。它会列出消费者群组读取的所有主题和分区的信息以及每个分区的偏移量信息。表12-1对列出的信息字段做了详细说明。
+
+![avatar](img/26.png)
+
+下面是获取临时消费者群组“my-consumer”的详细信息。
+
+```shell
+# kafka-consumer-groups.sh --bootstrap-server localhost:9092
+--describe --group my-consumer
+GROUP          TOPIC          PARTITION  CURRENT-OFFSET  LOG-END-OFFSET
+LAG        CONSUMER-ID
+HOST                           CLIENT-ID
+my-consumer     my-topic       0          2               4
+2          consumer-1-029af89c-873c-4751-a720-cefd41a669d6   /
+127.0.0.1 consumer-1
+my-consumer     my-topic       1          2               3
+1          consumer-1-029af89c-873c-4751-a720-cefd41a669d6   /
+127.0.0.1 consumer-1
+my-consumer     my-topic       2          2               3
+1          consumer-2-42c1abd4-e3b2-425d-a8bb-e1ea49b29bb2   /
+127.0.0.1 consumer-2
+#
+```
+
+### 12.2.2　删除消费者群组
+
+可以用 --delete命令来删除消费者群组。它将删除整个群组，包括所有已保存的偏移量。在删除群组之前，必须将群组里所有的消费者都关闭。如果你试图删除一个非空的群组，那么它将抛出“群组不为空”异常。也可以用这个命令删除单个主题的偏移量，只是需要额外提供 --topic参数，并指定要删除的偏移量。下面是删除消费者群组“my-consumer”的示例。
+
+```shell
+# kafka-consumer-groups.sh --bootstrap-server localhost:9092 --delete --group
+my-consumer
+Deletion of requested consumer groups ('my-consumer') was successful.
+#
+```
+
+### 12.2.3　偏移量管理
+
+除了显示和删除消费者群组的偏移量，还可以批量获取和保存消费者群组的偏移量，这在重置消费者偏移量时非常有用。当消费者因为某些原因需要重新读取消息或因为无法正常处理某些消息（比如格式错误的消息）需要跳过这些消息时就可以进行偏移量重置。
+
+__1.导出偏移量__
+
+要将消费者群组的偏移量导出到CSV文件，可以使用 --reset-offsets参数和 --dry-run参数。这样就可以将当前的偏移量导出到文件，并在需要的时候用于导入或回滚偏移量。导出的CSV文件格式如下所示。<topic-name>,<partition-number>,<offset>如果没有指定 --dry-run参数，那么偏移量将被重置，所以在执行这个命令时要十分小心。
+
+下面的例子会将消费者群组“my-consumer”读取的“my-topic”主题的偏移量导出到一个叫作oﬀsets.csv的文件中。
+
+```shell
+# kafka-consumer-groups.sh --bootstrap-server localhost:9092
+--export --group my-consumer --topic my-topic
+--reset-offsets --to-current --dry-run > offsets.csv
+# cat offsets.csv
+my-topic,0,8905
+my-topic,1,8915
+my-topic,2,9845
+my-topic,3,8072
+my-topic,4,8008
+my-topic,5,8319
+my-topic,6,8102
+my-topic,7,12739
+#
+```
+
+__2.导入偏移量__
+
+与导出偏移量刚好相反，导入偏移量会用之前导出的文件来重置消费者群组的偏移量。一般情况下，我们会先导出消费者群组的当前偏移量，并将导出的文件复制一份（作为备份）​，然后将文件中的偏移量修改成想要的值。
+
+在导入偏移量之前，必须先关闭所有的消费者。如果消费者群组处于活跃状态，那么当消费者正要写入偏移量时，不仅不会读取到导入的偏移量，反而有可能将它们覆盖掉。
+
+在下面的例子中导入上一个例子中导出的oﬀsets.csv文件，以此来重置消费者群组“my-consumer”的偏移量。
+
+```shell
+# kafka-consumer-groups.sh --bootstrap-server localhost:9092
+--reset-offsets --group my-consumer
+--from-file offsets.csv --execute
+  TOPIC                          PARTITION  NEW-OFFSET
+  my-topic                        0          8905
+  my-topic                        1          8915
+  my-topic                        2          9845
+  my-topic                        3          8072
+  my-topic                        4          8008
+  my-topic                        5          8319
+  my-topic                        6          8102
+  my-topic                        7          12739
+#
+```
+
+## 12.3　动态配置变更
+
+主题、客户端、broker等都有大量的配置参数可以在运行时动态更新，无须关闭或重新部署集群。可以使用kafka-config.sh来修改这些配置参数。目前，可以进行动态变更的配置参数主要有4种类型：主题、broker、用户和客户端。最好确保你使用的工具版本与Kafka版本相匹配。为了便于自动化管理动态配置参数，可以通过 --add-config-file参数来指定包含了你想要配置的参数的文件。
+
+### 12.3.1　覆盖主题的默认配置
+
+可以通过动态配置覆盖个别主题的默认值，以满足不同应用场景的需求。表12-2列出了可以被动态修改的主题配置参数。
+
+![avatar](img/27.png)
+
+修改主题配置的命令格式如下。
+
+```shell
+kafka-configs.sh --bootstrap-server localhost:9092
+--alter --entity-type topics --entity-name <topic-name>
+--add-config <key>=<value>[,<key>=<value>...]
+```
+
+下面的例子将主题“my-topic”的数据保留时间设置为1小时（3 600 000毫秒）​。
+
+```shell
+# kafka-configs.sh --bootstrap-server localhost:9092
+--alter --entity-type topics --entity-name my-topic
+--add-config retention.ms=3600000
+Updated config for topic: "my-topic".
+#
+```
+
+### 12.3.2　覆盖客户端和用户的默认配置
+
+对Kafka客户端和用户配置来说，只有少数参数可以覆盖，而且基本上都与配额有关。常见的两个需要修改的参数是生产者的生产速率和消费者的消费速率，以字节 / 秒为单位。表12-3列出了可以被修改的客户端和用户的配置参数。
+
+![avatar](img/28.png)
+
+下面的例子在一个配置步骤中同时修改了用户的控制器突变率和客户端的控制器突变率。
+
+```shell
+# kafka-configs.sh --bootstrap-server localhost:9092
+--alter --add-config "controller_mutations_rate=10"
+--entity-type clients --entity-name <client ID>
+--entity-type users --entity-name <user ID>
+#
+```
+
+### 12.3.3　覆盖broker的默认配置
+
+broker和集群级别的配置主要被放在静态的集群配置文件中，但仍然有大量的参数可以在运行时修改，也就是说修改这些参数无须重新部署Kafka。我们可以用kafka-config.sh修改80多个broker配置参数，不过本书不打算在这里一一罗列出来。可以通过 --help命令或在开源文档中找到它们，下面是其中几个比较重要的。
+
+__min.insync.replicas__
+
+当生产者的acks被设置为all或 -1时，用于确认消息写入成功所需的最少ISR数。
+
+__unclean.leader.election.enable__
+
+允许一个副本被选举为首领，即使可能会导致数据丢失。当允许丢失一些数据，或者在发生不可恢复的数据丢失后需要快速恢复Kafka集群时，可以短暂启用这个功能。
+
+__max.connections__
+
+broker允许的最大连接数。还可以用max.connections.per.ip和max.connections.per.ip.override进行更细粒度的节流。
+
+### 12.3.4　查看被覆盖的配置
+
+可以用kafka-config.sh列出所有被覆盖的配置，这样就可以知道主题、broker或客户端中都有哪些参数被覆盖。与其他工具类似，这是通过 --describe命令实现的。
+
+下面的例子列出了主题“my-topic”中所有被覆盖的配置。可以看到，被覆盖的只有“数据保留时间”这个参数。
+
+```shell
+# kafka-configs.sh --bootstrap-server localhost:9092
+--describe --entity-type topics --entity-name my-topic
+Configs for topics:my-topic are
+retention.ms=3600000
+#
+```
+
+### 12.3.5　移除被覆盖的配置
+
+也可以移除动态配置，将其恢复到集群的默认配置。可以用 --alter命令和 --delete-config参数来移除被覆盖的配置。例如，移除主题“my-topic”的retention.ms覆盖配置。
+
+```shell
+# kafka-configs.sh --bootstrap-server localhost:9092
+--alter --entity-type topics --entity-name my-topic
+--delete-config retention.ms
+Updated config for topic: "my-topic".
+#
+```
+
+## 12.4　生产和消费
+
+在使用Kafka时，为了验证应用程序的逻辑，经常需要手动生成或消费一些示例消息。Kafka为此提供了两个工具，即kafka-console-consumer.sh和kafka-console-producer.sh。
+
+### 12.4.1　控制台生产者
+
+可以用kafka-console-producer.sh向Kafka主题写入消息。在默认情况下，一行输入就是一条消息，消息的键和值以Tab字符分隔（如果没有出现Tab字符，那么键就是null）​。与控制台消费者一样，生产者使用默认的序列化器(DefaultEncoder)生成原始字节。控制台生产者要求至少提供两个参数，以便知道要连接到哪个Kafka集群，以及向哪个主题生成数据。第一个是我们经常使用的 --bootstrap-server连接串。在生成数据结束后，需要发送一个文件结束符(EOF)来关闭客户端。对于大多数常见的终端，可以使用Control-D组合键来发送EOF。在下面的例子中，我们向主题“my-topic”生成了4条消息。
+
+```shell
+# kafka-console-producer.sh --bootstrap-server localhost:9092 --topic my-topic
+>Message 1
+>Test Message 2
+>Test Message 3
+>Message 4
+>^D
+#
+```
+
+__1.生产者配置参数__
+
+也可以将普通生产者的配置参数传给控制台生产者。传递参数有两种方式，使用哪一种取决于需要传多少个参数以及个人偏好。第一种方式是通过 --producer.config <config-file>指定生产者配置文件，其中<config-file>是包含了配置参数的文件的完整路径。第二种方式是在命令行直接指定参数，格式为 --producer-property <key>=<value>，其中<key>是参数名，<value>是参数值。这在配置生产者的一些参数 [ 比如消息批次的相关参数（linger.ms或batch.size）​] 时非常有用。
+
+控制台生产者有很多命令行参数，我们可以通过 --producer-property来指定它们。以下是其中一些有用的参数。
+
+__--batch-size__
+
+指定在采用非同步发送方式时单个批次发送的消息数量。
+
+__--timeout__
+
+指定生产者在采用异步发送模式时等待批次填满消息的最长时间，以避免其在低吞吐量的情况下等待太长时间。
+
+__--compression-codec <string>__
+
+指定生成消息所使用的压缩类型，可以是none、gzip、snappy、zstd或lz4，默认值是gzip。
+
+__--sync__
+
+指定以同步的方式发送消息。也就是说，在发送下一条消息之前需要等待当前消息被确认。
+
+__2.文本行读取器配置参数__
+
+kafka.tools.ConsoleProducer$LineMessageReader类负责读取标准输入，并基于读取到的内容创建要发送给Kafka的消息。它也有一些非常有用的配置参数，我们可以通过 --property把这些配置参数传给控制台生产者。
+
+__ignore.error__
+
+如果设置为false，那么在parse.key被设置为true而标准输入中没有包含键分隔符时就会抛出异常。默认值为true。
+
+__parse.key__
+
+如果设置为false，那么生成的消息的键就为空。默认值为true。
+
+__key.separator__
+
+消息的键和值之间的分隔符。默认使用Tab字符。
+
+### 12.4.2　控制台消费者
+
+kafka-console-consumer.sh为我们提供了另外一种从Kafka集群的一个或多个主题读取消息的方式。它读取的消息会被打印在标准输出中，并用换行符分隔。在默认情况下，它将输出消息的原始字节，没有键，也不进行格式化（使用DefaultFormatter）​。与生产者类似，它也有一些必选的配置参数：集群连接串、要读取的主题以及要读取的消息的位置。
+
+和其他命令一样，可以通过 --bootstrap-server来指定集群连接串，不过要读取的主题的名字可以通过以下两个参数来指定。
+
+__--topic__
+
+这个参数会直接指定要读取的主题的名字。
+
+__--whitelist__
+
+这个参数是一个正则表达式，其匹配所有要读取的主题（要记得转义正则表达式，以免命令行解析错误）​。
+
+下面的例子读取的是集群中所有前缀与my匹配的主题（在这个例子中只有一个匹配的主题“my-topic”​）​。
+
+```shell
+# kafka-console-consumer.sh --bootstrap-server localhost:9092
+--whitelist 'my.*' --from-beginning
+Message 1
+Test Message 2
+Test Message 3
+Message 4
+^C
+#
+```
+
+__1.消费者配置参数__
+
+除了这些基本的命令行参数，也可以将普通消费者的配置参数传给控制台消费者。与kafka-console-producer.sh类似，传递参数有两种方式，使用哪一种取决于需要传多少个参数以及个人偏好。第一种方式是通过 --consumer.config <config-file>指定消费者配置文件，其中<config-file>是包含了配置参数的文件的完整路径。第二种方式是在命令行中直接指定参数，格式为 --consumer-property =，其中<key>是参数名，<value>是参数值。
+
+__--formatter <classname>__
+
+指定用于解码消息的消息格式化器的类名，默认是kafka.tools.DefaultMessageFormatter。
+
+__--from-beginning__
+
+指定从最旧的偏移量开始读取数据。如果不指定这个参数，就从最新的偏移量开始读取。
+
+__--max-messages <int>__
+
+指定在退出之前最多读取多少条消息。
+
+__--partition <int>__
+
+只读取指定ID的分区。
+
+__--offset__
+
+如果提供的是整数，就从指定位置开始读取数据。其他有效的值为earliest（将从起始位置开始读取）和latest（将从最近的位置开始读取）​。
+
+__--skip-message-on-error__
+
+如果在处理消息时出现错误就跳过消息，而不是一直挂起，这在调试问题时会非常有用。
+
+__2.消息格式化器配置参数__
+
+除了默认的消息格式化器，还有另外3种可用的格式化器。kafka.tools.LoggingMessageFormatter将消息输出到日志而不是标准输出。对应的日志级别为INFO，打印内容包含消息的时间戳、键和值。kafka.tools.ChecksumMessageFormatter只打印消息的校验和。kafka.tools.NoOpMessageFormatter读取但不打印消息。下面的例子会使用kafka.tools.ChecksumMessageFormatter格式化器来读取之前的消息。
+
+```shell
+# kafka-console-consumer.sh --bootstrap-server localhost:9092
+--whitelist 'my.*' --from-beginning
+--formatter kafka.tools.ChecksumMessageFormatter
+checksum:0
+checksum:0
+checksum:0
+checksum:0
+#
+```
+
+__3.读取偏移量主题__
+
+有时候，需要查看集群的消费者群组提交了哪些偏移量。例如，你可能想知道某个消费者群组是否在提交偏移量，或者在以怎样的频率提交偏移量。这可以通过使用控制台消费者读取consumer_offsets这个特殊的内部主题来实现。所有的消费者偏移量都会被写入这个主题。要解码这个主题中的消息，必须使用kafka.coordinator.group.GroupmetadataMan ager$OffsetsMessageFormatter这个格式化器。下面的例子会从最早的偏移量位置开始读取consumer_offsets主题。
+
+```shell
+# kafka-console-consumer.sh --bootstrap-server localhost:9092
+--topic __consumer_offsets --from-beginning --max-messages 1
+--formatter "kafka.coordinator.group.GroupMetadataManager\$OffsetsMessageFormat
+ter"
+--consumer-property exclude.internal.topics=false
+[my-group-name,my-topic,0]::[OffsetMetadata[1,NO_METADATA]
+CommitTime 1623034799990 ExpirationTime 1623639599990]
+Processed a total of 1 messages
+#
+```
+
+## 12.5　分区管理
+
+Kafka提供了一些用于管理分区的脚本，其中一个用于重新选举首领，另一个用于将分区分配给broker。有了这两个工具，就可以通过手动的方式让消息流量均衡地分布在集群的broker上。
+
+### 12.5.1　首选首领选举
+
+为了保证可靠性，分区可以有多个副本。在任意时刻，这些副本当中只能有一个可以成为分区首领，所有的写入操作和读取操作都发生在分区首领所在的broker上。为了保证负载均衡地分布在整个Kafka集群中，需要保持不同分区的首领均衡地分布在broker上。
+
+Kafka会将分区副本清单中的第一个ISR定义为首选首领。当broker停止运行或与集群中的其他broker断开连接时，分区领导权将被转移给另一个ISR，原始副本就自动丧失了分区领导权。如果不启用自动首领均衡，那么在进行跨集群部署后可能会出现非常低效的均衡。因此，建议启用
+
+如果发现Kafka集群变得不均衡了，则可以考虑进行首选首领选举，这是一个轻量级的首领选举过程，一般来说不会造成负面影响。集群控制器会为分区选择理想的首领。客户端可以自动跟踪首领变更，如果领导权发生了变更，则它们会转移到新首领所在的broker。这个过程可以用kafka-leader-election.sh来手动触发。
+
+例如，可以使用下面的命令为集群中的所有主题启动一个首选首领选举。
+
+```shell
+# kafka-leader-election.sh --bootstrap-server localhost:9092
+--election-type PREFERRED --all-topic-partitions
+#
+```
+
+也可以为特定的分区或主题启动选举，直接用 --topic参数指定主题名，用 --partition参数指定分区。还可以指定一个清单，其中包含了多个参与选举的分区，这个清单包含在一个名为partitions.json的JSON文件中。
+
+```json
+{
+    "partitions": [
+        {
+            "partition": 1,
+            "topic": "my-topic"
+        },
+        {
+            "partition": 2,
+            "topic": "foo"
+        }
+    ]
+}
+```
+
+在这个例子中，我们将通过partitions.json文件指定的分区清单启动一个首选首领选举。
+
+```shell
+# kafka-leader-election.sh --bootstrap-server localhost:9092
+--election-type PREFERRED --path-to-json-file partitions.json
+#
+```
+
+有了这个JSON文件，就可以用它生成移动清单，以便在后面的步骤中将topics.json中的主题移动到broker 5和broker 6上。
+
+```shell
+# kafka-reassign-partitions.sh --bootstrap-server localhost:9092
+--topics-to-move-json-file topics.json
+--broker-list 5,6 --generate
+  {"version":1,
+  "partitions":[{"topic":"foo1","partition":2,"replicas":[1,2]},
+                {"topic":"foo1","partition":0,"replicas":[3,4]},
+                {"topic":"foo2","partition":2,"replicas":[1,2]},
+                {"topic":"foo2","partition":0,"replicas":[3,4]},
+                {"topic":"foo1","partition":1,"replicas":[2,3]},
+                {"topic":"foo2","partition":1,"replicas":[2,3]}]
+  }
+
+  Proposed partition reassignment configuration
+
+  {"version":1,
+  "partitions":[{"topic":"foo1","partition":2,"replicas":[5,6]},
+                {"topic":"foo1","partition":0,"replicas":[5,6]},
+                {"topic":"foo2","partition":2,"replicas":[5,6]},
+                {"topic":"foo2","partition":0,"replicas":[5,6]},
+                {"topic":"foo1","partition":1,"replicas":[5,6]},
+                {"topic":"foo2","partition":1,"replicas":[5,6]}]
+  }
+#
+```
+
+可以分别将两个JSON片段保存成两个JSON文件，一个叫作revert-reassignment.json，另一个叫作expand-cluster-reassignment.json。如果因为某些原因需要回滚，则可以用第一个文件将分区移回原来的位置。第二个文件用于在下一步执行分区调整。这一步只是生成建议，还没有执行任何操作.
+
+```shell
+# kafka-reassign-partitions.sh --bootstrap-server localhost:9092
+--reassignment-json-file expand-cluster-reassignment.json
+--execute
+  Current partition replica assignment
+
+  {"version":1,
+  "partitions":[{"topic":"foo1","partition":2,"replicas":[1,2]},
+                {"topic":"foo1","partition":0,"replicas":[3,4]},
+                {"topic":"foo2","partition":2,"replicas":[1,2]},
+                {"topic":"foo2","partition":0,"replicas":[3,4]},
+                {"topic":"foo1","partition":1,"replicas":[2,3]},
+                {"topic":"foo2","partition":1,"replicas":[2,3]}]
+  }
+
+  Save this to use as the --reassignment-json-file option during rollback
+  Successfully started reassignment of partitions
+  {"version":1,
+  "partitions":[{"topic":"foo1","partition":2,"replicas":[5,6]},
+                {"topic":"foo1","partition":0,"replicas":[5,6]},
+                {"topic":"foo2","partition":2,"replicas":[5,6]},
+                {"topic":"foo2","partition":0,"replicas":[5,6]},
+                {"topic":"foo1","partition":1,"replicas":[5,6]},
+                {"topic":"foo2","partition":1,"replicas":[5,6]}]
+  }
+#
+```
+
+这样就开始将指定的分区副本重新分配给新broker了。输出结果与之前生成的建议一样。集群控制器会将新副本添加到每个分区的副本清单中，这些主题的复制系数会临时变大。然后，新副本将从当前首领复制已有的消息。根据磁盘上分区的大小，当数据通过网络复制到新副本时，可能需要花费一些时间。复制完成之后，控制器会将旧副本从副本清单中移除，让复制系数恢复到原来的大小。
+
+
+下面是这个工具的一些有用的参数。
+
+__--additional__
+
+如果已经有进行中的重分配过程，就加入其中，这样就不会出现中断，也不需要等待已有的重分配完毕之后再启动一个新的批次。
+
+__--disable-rack-aware__
+
+有时候，因为启用了机架感知，可能无法实现想要的重分配状态。如果有必要，那么可以用这个参数禁用机架感知。
+
+__--throttle__
+
+这个参数以字节 / 秒为单位。分区重分配对集群性能有很大的影响，因为它们会导致内存缓存页的一致性发生变化，并占用额外的网络带宽和磁盘IO。对分区移动流量进行节流可以有效缓解这个问题。这个参数可以与 
+
+__--additional__
+
+结合使用，以便对进行中的可能导致上述问题的重分配过程进行节流。
+
+__--disable-rack-aware__
+
+有时候，因为启用了机架感知，可能无法实现想要的重分配状态。如果有必要，那么可以用这个参数禁用机架感知。
+
+__--throttle__
+
+这个参数以字节 / 秒为单位。分区重分配对集群性能有很大的影响，因为它们会导致内存缓存页的一致性发生变化，并占用额外的网络带宽和磁盘IO。对分区移动流量进行节流可以有效缓解这个问题。这个参数可以与 --additional结合使用，以便对进行中的可能导致上述问题的重分配过程进行节流。
+
+如果要移除一个broker的多个分区（将这个broker从集群中删除）​，那么最好可以先移除这个broker所有的分区首领。这可以通过手动的方式实现，但要用之前介绍的工具来完成这个操作有点儿困难。一些开源工具（如Cruise Control）提供了broker“降级”等功能，它们可以安全地将broker的领导权转移出去。这可能是最简单的方法。如果不能使用这些工具，那么就重启broker。在broker被关闭的过程中，位于这个broker上的所有分区首领都将被转移到其他broker上。这样可以显著提高副本重分配的性能，并减少对集群的影响，因为复制流量被其他broker分摊掉了。但是，如果启用了自动首领重分配，则broker在重启后有可能会重新获得领导权。所以，在重启期间最好临时禁用这个功能。
+
+也可以用这个工具来验证重分配的完成情况。它可以显示哪些重分配正在进行当中、哪些已经完成，以及（如果出错的话）哪些已经失败。下面是通过 --verify参数基于expand-cluster-reassignment.json文件对之前的分区重分配进行验证的例子。
+
+```shell
+# kafka-reassign-partitions.sh --bootstrap-server localhost:9092
+--reassignment-json-file expand-cluster-reassignment.json
+--verify
+Status of partition reassignment:
+  Reassignment of partition [foo1,0] completed successfully
+  Reassignment of partition [foo1,1] is in progress
+  Reassignment of partition [foo1,2] is in progress
+  Reassignment of partition [foo2,0] completed successfully
+  Reassignment of partition [foo2,1] completed successfully
+  Reassignment of partition [foo2,2] completed successfully
+#
+```
+
+__1.修改复制系数__
+
+也可以用kafka-reassign-partitions.sh来增加或减少一个分区的RF(RF 是 Replication Factor（副本因子）的缩写，表示一个分区的副本数量，)。如果在创建分区时没有选择合适的RF，那么当你在扩展集群时想要增加冗余或为了节约成本想要减少冗余，就需要修改RF。一个很明显的例子是，如果集群的默认RF被修改了，但已有主题的RF不会自动随之发生变化，那么这个时候就可以用这个工具增加已有分区的RF。
+
+假设你想将之前示例中“foo1”主题的RF从2增加到3，那么可以创建一个类似于之前用于执行分区调整的JSON文件，然后再向副本集中加入额外的broker ID。例如，可以创建一个叫作increase-foo1-RF.json的JSON文件，并将broker 4添加到已有的broker 5和broker 6集合中。
+
+```shell
+{
+  {"version":1,
+  "partitions":[{"topic":"foo1","partition":1,"replicas":[5,6,4]},
+                {"topic":"foo1","partition":2,"replicas":[5,6,4]},
+                {"topic":"foo1","partition":3,"replicas":[5,6,4]},
+  }
+}
+```
+
+然后，使用之前的命令执行这个文件。在执行完成之后，可以用 --verify参数或kafka-topics.sh脚本列出主题信息，以此来验证RF是否已经修改成功。
+
+```shell
+# kafka-topics.sh --bootstrap-server localhost:9092 --topic foo1 --describe
+  Topic:foo1    PartitionCount:3        ReplicationFactor:3     Configs:
+    Topic: foo1 Partition: 0    Leader: 5       Replicas: 5,6,4 Isr: 5,6,4
+    Topic: foo1 Partition: 1    Leader: 5       Replicas: 5,6,4 Isr: 5,6,4
+    Topic: foo1 Partition: 2    Leader: 5       Replicas: 5,6,4 Isr: 5,6,4
+#
+```
+
+__2.取消分区重分配__
+
+kafka-reassign-partitions.sh脚本（对AdminClient进行了包装）现在支持 --cancel选项，我们可以用它来取消集群中正在进行的重分配过程。如果指定了 --cancel选项，那么副本集将会被恢复到重分配之前的状态。如果正在从已经失效或过载的broker中移除副本，则取消分区重分配有可能会导致集群处于非预期的状态，也不能保证恢复后的副本集的顺序与之前相同。
+
+### 12.5.3　转储日志片段
+
+有时候，你可能需要查看消息的内容，比如主题中出现了已损坏的“毒药”消息，而用户无法处理它们。可以用kafka-dump-log.sh来解码分区的日志片段，这样就可以在不读取和解码消息的情况下查看消息的内容。这个工具以日志片段文件列表（以逗号分隔）作为参数，可以输出消息的摘要信息或详细内容。
+
+在下面的例子中，我们对只包含4条消息的“my-topic”主题进行了日志转储。首先，简单地解码日志片段文件00000000000000000000.log，并获取每条消息的基本元数据信息，但不打印消息内容。Kafka的数据目录是 /tmp/kafka-logs。因此，可以在 /tmp/kafka-logs/<topic-name>-<partition> 目录下找到转储文件，对这个例子来说就是/tmp/kafka-logs/my-topic-0/。
+
+```shell
+# kafka-dump-log.sh --files /tmp/kafka-logs/my-topic-0/00000000000000000000.log
+Dumping /tmp/kafka-logs/my-topic-0/00000000000000000000.log
+Starting offset: 0
+baseOffset: 0 lastOffset: 0 count: 1 baseSequence: -1 lastSequence: -1
+  producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0
+  isTransactional: false isControl: false position: 0
+  CreateTime: 1623034799990 size: 77 magic: 2
+  compresscodec: NONE crc: 1773642166 isvalid: true
+baseOffset: 1 lastOffset: 1 count: 1 baseSequence: -1 lastSequence: -1
+  producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0
+  isTransactional: false isControl: false position: 77
+  CreateTime: 1623034803631 size: 82 magic: 2
+  compresscodec: NONE crc: 1638234280 isvalid: true
+baseOffset: 2 lastOffset: 2 count: 1 baseSequence: -1 lastSequence: -1
+  producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0
+  isTransactional: false isControl: false position: 159
+  CreateTime: 1623034808233 size: 82 magic: 2
+  compresscodec: NONE crc: 4143814684 isvalid: true
+baseOffset: 3 lastOffset: 3 count: 1 baseSequence: -1 lastSequence: -1
+  producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0
+  isTransactional: false isControl: false position: 241
+  CreateTime: 1623034811837 size: 77 magic: 2
+  compresscodec: NONE crc: 3096928182 isvalid: true
+#
+```
+
+在下一个例子中，我们提供了 --print-data-log参数，这样就可以打印出消息的内容和其他更多的信息。
+
+```shell
+# kafka-dump-log.sh --files /tmp/kafka-logs/my-topic-0/00000000000000000000.log
+--print-data-log
+Dumping /tmp/kafka-logs/my-topic-0/00000000000000000000.log
+Starting offset: 0
+baseOffset: 0 lastOffset: 0 count: 1 baseSequence: -1 lastSequence: -1
+  producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0
+  isTransactional: false  isControl: false position: 0
+  CreateTime: 1623034799990 size: 77 magic: 2
+  compresscodec: NONE crc: 1773642166 isvalid: true
+| offset: 0 CreateTime: 1623034799990 keysize: -1 valuesize: 9
+    sequence: -1 headerKeys: [] payload: Message 1
+baseOffset: 1 lastOffset: 1 count: 1 baseSequence: -1 lastSequence: -1
+  producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0
+  isTransactional: false isControl: false position: 77
+  CreateTime: 1623034803631 size: 82 magic: 2
+  compresscodec: NONE crc: 1638234280 isvalid: true
+| offset: 1 CreateTime: 1623034803631 keysize: -1 valuesize: 14
+    sequence: -1 headerKeys: [] payload: Test Message 2
+baseOffset: 2 lastOffset: 2 count: 1 baseSequence: -1 lastSequence: -1
+  producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0
+  isTransactional: false isControl: false position: 159
+  CreateTime: 1623034808233 size: 82 magic: 2
+  compresscodec: NONE crc: 4143814684 isvalid: true
+| offset: 2 CreateTime: 1623034808233 keysize: -1 valuesize: 14
+    sequence: -1 headerKeys: [] payload: Test Message 3
+baseOffset: 3 lastOffset: 3 count: 1 baseSequence: -1 lastSequence: -1
+  producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0
+  isTransactional: false isControl: false position: 241
+  CreateTime: 1623034811837 size: 77 magic: 2
+  compresscodec: NONE crc: 3096928182 isvalid: true
+| offset: 3 CreateTime: 1623034811837 keysize: -1 valuesize: 9
+    sequence: -1 headerKeys: [] payload: Message 4
+#
+```
+
+这个工具还提供了其他一些有用的参数，比如验证日志片段的索引文件。索引用于查找日志片段中的消息，如果索引出现损坏，则会导致读取错误。如果broker在启动时处于“不干净”的状态（之前被非正常关闭）​，就会对索引文件进行验证。也可以手动进行索引验证。验证索引有两种方式，使用哪一种取决于你想验证到什么程度。如果指定了 --index-sanity-check，就会只检查索引是否处于可用状态；如果指定了--verify-index-only，则会检查不匹配的索引，但不会打印出所有的索引条目。还有一个有用的选项是 --value-decoder-class，可以用它指定用于反序列化消息的解码器。
+
+### 12.5.4　副本验证
+
+分区复制的原理与普通的消费者客户端类似：跟随者broker会定期将上一个偏移量到当前偏移量之间的数据复制到磁盘上。如果复制过程停止，那么在重启之后将从上一个检查点继续复制。这个时候，如果之前复制的日志片段被删除，那么跟随者将不会填补这个缺口。可以用kafka-replica-verification.sh来验证集群分区副本的一致性。它会从指定分区的副本读取消息，检查所有副本是否包含了相同的消息，并打印出指定分区的最大延迟。这个过程会一直重复，直到被取消。要使用这个工具，必须提供broker的连接串（如果有多个broker地址，就用逗号隔开）​。在默认情况下，它会验证所有的主题。还可以用正则表达式匹配想要验证的主题
+
+例如，下面的例子会对broker 1和broker 2（包含“my-topic”主题的分区0）上以my开头的主题的副本进行验证。
+
+```shell
+# kafka-replica-verification.sh --broker-list kafka.host1.domain.com:
+9092,kafka.host2.domain.com:9092
+--topic-white-list 'my.*'
+
+2021-06-07 03:28:21,829: verification process is started.
+2021-06-07 03:28:51,949: max lag is 0 for partition my-topic-0 at offset 4
+among 1 partitions
+2021-06-07 03:29:22,039: max lag is 0 for partition my-topic-0 at offset 4
+among 1 partitions
+...
+#
+```
+
+## 12.6　其他工具
+
+__客户端AC__
+
+Lkafka-acls.sh是一个命令行工具，可用于设置Kafka客户端ACL，包括所有的授权器属性、拒绝或允许策略的设置、集群或主题级别的限制、ZooKeeper TLS文件配置等。
+
+__轻量级MirrorMaker__
+
+一个轻量级的kafka-mirror-maker.sh脚本，可用于镜像数据。有关数据镜像的更多内容可以参考第10章。
+
+__测试工具__
+
+还有其他几个可用于测试或升级Kafka的脚本。当从一个Kafka版本升级到另一个版本时，可以用kafka-broker-api-versions.sh来识别不同版本的可用API元素和检查兼容性问题。生产者和消费者也有对应的性能测试脚本。还有几个脚本可用于管理ZooKeeper。trogdor.sh是一个测试框架，主要用于运行基准测试和为系统制造测试工作负载。
+
+## 12.7　不安全的操作
+
+### 12.7.1　移动集群控制器
+
+每个Kafka集群都有一个被指定为控制器的broker。控制器有一个特殊的线程，除了处理普通的任务，它还负责监督集群操作。正常情况下，控制器选举是通过自动监听ZooKeeper临时节点来完成的。当一个控制器被关闭或变为不可用时，其他broker会尽快尝试让自己成为新控制器，因为一旦控制器被关闭，ZooKeeper临时节点就会被删除。有时候，在对问题集群或broker进行故障诊断时，需要在不关闭主机的情况下强制将控制器角色转移给另一个broker。例如，当控制器遇到异常或其他问题时，虽然还在运行，但功能已经变得不正常。在这些情况下转移控制器通常不会有很高的风险，但这不是一个普通的操作，所以不应该经常这么做。如果要强制转移控制器，则需要手动删除 /admin/controller下的ZooKeeper节点，让当前控制器退出，而集群会随机选择一个新的控制器。目前，Kafka还不支持直接将指定的broker作为控制器.
+
+### 12.7.2　移除待删除的主题
+
+在尝试删除一个主题时，broker会请求ZooKeeper创建一个删除节点。当每一个副本都完成删除并进行了确认时，ZooKeeper节点将被移除。在正常情况下，集群可以非常快地执行完这个过程。但是，有时候也会出问题。以下是删除请求可能被卡住的场景。
+
+1.请求者无法知道集群是否启用了主题删除功能，而要删除的主题所在的集群可能刚好禁用了主题删除功能。2.请求删除一个非常大的主题，但在处理这个请求之前，一个或多个副本集因发生硬件故障而离线，控制器无法对删除操作做出确认，也就无法完成删除操作。要解决这个问题，需要先删除 /admin/delete_topic/<topic> 节点。删除主题的ZooKeeper节点（不是 /admin/delete_topic父节点）等于删除了挂起的请求。如果控制器中有缓存的请求，它就会重新排队，所以在删除主题的节点后要立即强制转移控制器，确保控制器中没有缓存的请求。
+
+### 12.7.3　手动删除主题
+
+如果集群禁用了主题删除功能，或者需要通过非正式的途径删除某些主题，那么可以进行手动删除。但是，这需要完全关闭集群中所有的broker，只要集群中有一个运行中的broker，就无法执行这个操作。
+
+在集群还在运行的时候修改ZooKeeper中的元数据是很危险的，这会造成集群不稳定。所以，在集群还在运行的时候不要删除或修改ZooKeeper中的元数据。
+
+1.关闭集群中所有的broker。2.删除ZooKeeper中的 /brokers/topics/ 路径，注意要先删除路径下的子节点。3.删除每一个broker的日志目录下的分区目录，这些目录的名字可能是<topic>-<int>，其中 <int> 是分区的ID。4.重启所有的broker。
+
+# 第13章　监控Kafka
+
+## 13.1　指标基础
+
+### 13.1.1　指标来自哪里
+
+Kafka提供的所有指标都可以通过Java管理扩展(Java managementextension, JMX)接口访问。要在外部监控系统中使用这些指标，最简单的方法是将监控系统中负责收集指标的代理连接到Kafka上。代理可以是运行在监控系统中的一个独立进程，并用Nagios XI check_jmx插件或jmxtrans连接到Kafka的JMX接口上。你也可以直接在Kafka中运行一个JMX代理，然后通过HTTP连接（比如Jolokia或MX4J）获取指标。
+
+JMX端口是broker配置信息的一部分，保存在ZooKeeper中，如果监 控系统要直接连到Kafka的JMX端口，那么可以先从ZooKeeper获取端口信息。/brokers/ids/<ID> 节点包含了broker的配置信息（JSON格式）​，其中就有hostname和jmx_port。不过需要注意的是，出于安全方面的考虑，Kafka默认禁用了远程JMX。如果要启用它，则必须保护好端口。这是因为JMX不仅可以作为查看应用程序状态的窗口，它还允许执行代码。强烈建议使用嵌入应用程序中的JMX指标代理。
+
+并不是所有的指标都来自Kafka。我们能够获取到的指标通常可以分为5类，表13-1列出了这5种类别。
+
+![avatar](img/29.png)
+
+### 13.1.2　需要哪些指标
+
+__1.告警还是调试__
+
+你需要问自己的第一个问题是，当Kafka出现问题时，你的主要目的是收到告警还是调试问题。答案通常是二者兼而有之。不管怎样，如果你知道哪些指标可用于告警、哪些指标可用于调试问题，那么在收集完之后就可以区别对待它们。
+
+用于告警的指标在短时间内（通常不会比对问题做出响应所需的时间长很多）非常有用。你可以以小时或天为单位，将这些指标发送给能够对已知问题做出响应的自动化工具，或者如果没有自动化工具，则可以发送给运维人员。这些指标要尽量保持客观，因为不会影响客户端的问题远没有会影响客户的问题那么重要。
+
+用于调试问题的数据需要保留较长的时间，因为你可能会频繁诊断已经存在一段时间的问题或对比较复杂的问题进行更深入的探究。这些数据在被收集到之后需要保留几天或几周。它们通常比较客观，或者是来自Kafka应用程序本身。需要注意的是，并不一定要将这些数据收集到监控系统中。如果主要目的是调试问题，那么在调试问题时能够获取它们就可以了。不需要持续不断地收集数以万计的指标，从而让监控系统不堪重负。
+
+__2.自动化工具还是人工介入__
+
+另一个需要考虑的问题是，指标的使用者是谁。如果指标被用在自动化系统中，那么它们就应该非常具体。我们可以收集大量的指标，并且每个指标都只描述一些小细节，这没有问题，因为这就是计算机存在的原因：处理大量的数据。指标越具体，就越容易对其进行自动化，因为越具体就越没有太多的解释空间。如果指标是给人类看的，那么太多的指标会让人类不堪重负。在基于指标定义告警时，这一点尤为重要。人们很容易陷入“告警疲劳”​，因为告警太多，很难知道问题究竟有多严重。我们也很难为每个指标定义合理的阈值并持续更新它们。如果告警过多或经常误报，我们就会怀疑告警是否正确地反映了应用程序的状态。
+
+### 13.1.3　应用程序健康检测
+
+● 使用外部进程来报告broker的运行状态（健康检测）​。
+
+● 在broker停止发送指标时发出告警（有时也叫作过时指标）​。
+
+如果监控的是broker，那么可以直接连接到它的外部端口（也就是客户端连接broker所使用的端口）​，看看是否可以获得响应；如果监控的是Kafka客户端，则会比较复杂，我们需要检查客户端进程是否处于运行状态或通过内部方法确定应用程序的健康状况。
+
+## 13.2　服务级别目标
+
+对基础设施服务（如Kafka）来说，服务级别目标(service levelobjective, SLO)是一个非常重要的监控领域。服务供应商可以基于这些指标向客户宣称他们能够获得怎样的基础设施服务级别。客户希望将基础设施服务视为一个不透明的系统：他们不想也不需要了解它的内部原理，只需要了解他们正在使用的接口，并且知道这些接口会完成需要它们完成的事情。
+
+###  13.2.1　服务级别定义
+
+服务级别指标(service level indicator, SLI)是一种用于描述服务可靠性的指标。因为它与用户体验紧密相关，所以通常来说越客观越好。
+
+服务级别目标(SLO)也叫作服务级别阈值(service level threshold,SLT)，它将SLI与目标值组合在一起。服务级别目标的一种常见表示方法是使用数字9（99.9%就是3个9）​，尽管这不是必需的。
+
+服务级别协议(service level agreement, SLA)是服务供应商和客户之间的一种契约。它通常会包含几个SLO，以及如何度量和报告它们、客户如何向服务供应商寻求支持、服务供应商如果不按照SLA执行将受到怎样的惩罚。
+
+我们经常听到人们谈论SLA，但他们并不知道自己谈论的其实是SLO。虽然那些为付费客户提供服务的供应商可能与客户之间存在SLA，但运营工程师很少会负责服务性能以外的事情。此外，那些只有内部用户（也就是将Kafka作为大型服务的内部数据基础设施）的供应商与内部用户之间通常不存在SLA。但这并不影响你设定SLO，因为这样可以减少用户对Kafka的行为做出假设。
+
+### 13.2.2　哪些指标是好的SLI
+
+通常，需要使用外部工具或系统来收集适用于SLI的指标。SLO可以用来描述你服务的用户的满意度，我们无法主观地得出这些指标。客户并不关心你是否认为你的服务运行正常，他们的体验才是关键。也就是说，基础设施指标没什么问题，外部工具指标也不错，但客户端指标可能是大多数SLI的最佳指标。
+
+![avatar](img/30.png)
+
+### 13.2.3　将SLO用于告警
+
+SLO应该为你提供主要的告警。因为SLO是从客户的角度描述问题，而这些问题应该是你首先要关注的。一般来说，如果一个问题不会对你的客户造成影响，就不会重要到要在夜里把你叫醒的程度。
+
+问题在于，我们很难直接将SLO作为告警。SLO的时间范围通常较长（比如一周）​，因为我们希望提供给高层或客户的SLO是可重复查看的。此外，在发出SLO告警时，可能已经太迟了，因为你已经在SLO之外采取了行动。
+
+假设你的Kafka集群每周会收到100万个请求，其中一个SLO要求99.9%的请求必须在10毫秒内发送第一个响应字节。也就是说，在一周内，你可能会有多达1000个响应速度较慢的请求，但一切都还算正常。通常，你每小时会看到一个这样的请求，一周大约有168个。你有一个表示SLO燃烧率的指标：在每周有100万个请求的情况下，一个请求的燃烧率为0.1%/ 小时。
+
+周二上午10点，这个指标变了，现在显示燃烧率是0.4%/ 小时。虽然有点儿不妙，但仍然不是问题，因为在当周可能不会违反SLO。你开了一个工单诊断问题，然后又回到了其他更重要的事情上。周三下午2点，燃烧率跳到了2%/ 小时，系统向你发起告警。你知道，按照这样的速度，将会在周五午餐时间违反SLO。于是，你放下手头的工作，开始诊断问题。大约4小时后，燃烧率回落到了0.4%/ 小时，并在当周接下来的几天里一直保持在这个水平。通过观察燃烧率，你避免了违反当周的SLO。
+
+## 13.3　broker的指标
+
+### 13.3.1　诊断集群问题
+
+● 单个broker的问题
+
+● 集群过载
+
+● 控制器的问题
+
+如果问题不在操作系统或硬件层面，那么很可能是Kafka集群负载不均衡导致的。尽管Kafka尽量保持集群数据能够均匀地分布在所有的broker上，但并不能保证访问这些数据的客户端是均匀分布的。Kafka也无法检测出诸如热分区之类的问题。强烈建议使用外部工具来保持集群均衡，比如Cruise Control，它会持续监控集群，并在集群不均衡时对分区进行再均衡。它还提供了很多其他的管理功能，比如添加和删除broker。
+
+集群过载也是一个很容易检测的问题。如果集群是均衡的，并且多个broker的请求延迟一直在增加或者请求处理器空闲率较低，那么说明集群broker处理流量的能力达到了极限。你可能会发现一个客户端改变了它的请求模式，正在给你的集群制造麻烦。但即使发生了这种情况，你可能也无法对客户端做些什么。你能做的要么是降低集群负载，要么是增加broker。
+
+### 13.3.2　非同步分区的艺术
+
+在监控Kafka时，非同步分区是最为常见的监控指标。这个指标会告诉我们首领broker有多少个分区处于非同步状态。这个指标可以反映Kafka的很多内部问题，从broker发生崩溃到资源的过度消耗。因为这个指标可以说明很多问题，所以当它的值大于零时，就要想办法采取相应的行动。
+
+表13-3列出了非同步分区指标的详细信息。
+
+![avatar](img/31.png)
+
+在本书第1版和很多技术会议讨论中，作者们都提到了将非同步分区(URP)指标作为主要的告警指标，因为它可以说明很多问题。这种做法存在大量问题，因为在大部分良性的情况下，URP指标也会是非零值。也就是说，当有人操作Kafka集群时，你可能会收到错误的告警，从而导致真正的告警被忽略。你还需要掌握大量的知识才能理解这个指标要告诉你的是什么信息。因此，本书不再建议将URP用在告警中。应该使用基于SLO的告警来检测未知的问题。
+【在当下的市场环境下，用户对于系统的要求越来越高，在本书中URP不作为告警指标，但是在实际应用中应该酌情考虑】。
+
+如果集群中多个broker的非同步分区数量一直很稳定（保持不变）​，则说明集群中的某个broker已经离线了。整个集群的非同步分区数量等于离线broker的分区数量，而离线broker不会生成任何指标。在这种情况下，需要检查这个broker出了什么问题，并解决问题。通常可能是硬件问题，也可能是操作系统问题或Java的问题。
+
+如果非同步分区的数量是波动的，或者虽然很稳定但没有broker离线，那么说明集群出现了性能问题。这类问题繁复多样，难以诊断，不过还是可以通过一些步骤来缩小问题的范围。第一步，先确认问题是与单个broker有关还是与整个集群有关。有时候这个也难有定论。如果非同步分区属于单个broker（如下面的例子所示）​，那么这个broker就是问题的根源，因为错误显示其他broker无法从它那里复制消息。如果多个broker出现了非同步分区，那么有可能是集群的问题，但也有可能是单个broker的问题。这时候有可能是因为一个broker无法从其他broker那里复制数据。要找出这个broker，可以列出集群的所有非同步分区，并检查哪个broker出现在所有的非同步分区中。可以用kafka-topics.sh（第12章已经详细介绍过）获取非同步分区清单。
+
+```shell
+# kafka-topics.sh --bootstrap-server kafka1.example.com:9092/kafka-cluster-
+--describe --under-replicated
+    Topic: topicOne   Partition: 5    Leader: 1    Replicas: 1,2 Isr: 1
+    Topic: topicOne   Partition: 6    Leader: 3    Replicas: 2,3 Isr: 3
+    Topic: topicTwo   Partition: 3    Leader: 4    Replicas: 2,4 Isr: 4
+    Topic: topicTwo   Partition: 7    Leader: 5    Replicas: 5,2 Isr: 5
+    Topic: topicSix   Partition: 1    Leader: 3    Replicas: 2,3 Isr: 3
+    Topic: topicSix   Partition: 2    Leader: 1    Replicas: 1,2 Isr: 1
+    Topic: topicSix   Partition: 5    Leader: 6    Replicas: 2,6 Isr: 6
+    Topic: topicSix   Partition: 7    Leader: 7    Replicas: 7,2 Isr: 7
+    Topic: topicNine  Partition: 1    Leader: 1    Replicas: 1,2 Isr: 1
+    Topic: topicNine  Partition: 3    Leader: 3    Replicas: 2,3 Isr: 3
+    Topic: topicNine  Partition: 4    Leader: 3    Replicas: 3,2 Isr: 3
+    Topic: topicNine  Partition: 7    Leader: 3    Replicas: 2,3 Isr: 3
+    Topic: topicNine  Partition: 0    Leader: 3    Replicas: 2,3 Isr: 3
+    Topic: topicNine  Partition: 5    Leader: 6    Replicas: 6,2 Isr: 6
+#
+```
+
+在上面的示例中，broker 2出现在了所有的副本里，这说明这个broker在复制消息时出了问题，所以要将注意力放在这个broker上。如果没有发现这样的broker，那么问题有可能出在集群级别。
+
+__1.集群级别的问题__
+
+集群一般会出现以下两类问题。
+
+● 负载不均衡
+
+● 资源过度消耗
+
+虽然分区或首领的不均衡问题解决起来有点儿麻烦，但定位问题是很容易的。为了定位这个问题，需要用到broker的以下几个指标。
+
+● 分区数量
+
+● 首领分区数量
+
+● 所有主题的消息流入速率
+
+● 所有主题的字节流入速率
+
+● 所有主题的字节流出速率
+
+在一个均衡的集群中，这些指标的数值在整个集群范围内是均衡的，如表13-4所示。
+
+![avatar](img/32.png)
+
+可以看出，所有的broker处理的流量几乎是相等的。假设在运行了首选副本选举之后，这些指标出现了很大的偏差，而这说明集群的流量出现了不均衡。要解决这个问题，需要将负载较重的broker分区移动到负载较轻的broker上，这可以使用第12章中介绍的kafka-reassign-partitions.sh来实现。
+
+broker本身无法自动实现整个集群的分区重分配。Kafka集群的流量均衡是一个十分费劲的过程，需要手动检查一大堆指标，然后再进行副本重分配。一些组织开发了自动化工具来协助完成这个任务。例如，LinkedIn发布了一个叫作kafka-assigner的工具，该工具可以在LinkedIn的GitHub代码仓库kafka-tools中找到。一些供应商提供的Kafka服务也包含了这一功能。
+
+Kafka集群的另一个性能问题是请求数量超过了broker的处理能力。有很多潜在的瓶颈会拖慢整个集群：CPU、磁盘IO和网络吞吐量是其中最为常见的。磁盘使用率不在其列，因为broker会一直运行，直到磁盘被填满然后“挂掉”​。为了诊断这类问题，可以监控以下这些操作系统级别的指标。
+
+● CPU使用
+
+● 网络输入吞吐量
+
+● 网络输出吞吐量
+
+● 磁盘平均等待时间
+
+● 磁盘使用百分比
+
+上述任何一种资源出现过度消耗都会表现为分区不同步。需要注意的是，broker的复制过程与其他Kafka客户端做的事情是一样的。如果集群的数据复制出了问题，那么集群的用户在发送或读取消息时也会有问题。所以，有必要为这些指标定义一个基线，并设定相应的阈值，以便在容量告急之前就能定位到正在发生的问题。随着集群流量的增长，也有必要对这些指标的走势进行持续观察。在这些指标中，​“所有主题的字节流入速率”是查看集群资源使用情况的一个最好的指标。
+
+__2.主机级别的问题__
+
+如果性能问题不是出现在集群级别，而是出现在一两个broker中，就要检查一下broker所在的主机，看看是什么导致它与集群中的其他broker不一样。主机级别的问题可以分为以下几类。
+
+● 硬件故障
+
+● 网络
+
+● 进程冲突
+
+● 本地配置不一致
+
+磁盘故障是导致Kafka性能衰退的一个比较常见的硬件问题。Kafka使用磁盘来存储消息，生产者的性能与磁盘的写入速度有直接的关系。这里出现的任何偏差都会表现为生产者和消费者的性能问题，消费者的性能问题会导致分区不同步。因此，应该持续地监控磁盘，并在出现问题时马上进行修复。
+
+在网络方面，局部故障也会造成很大的问题。有些问题是硬件引起的，比如糟糕的光缆或连接器。有些问题是配置不当造成的，比如修改了服务器或上游网络硬件的网络连接速度或双工设置。网络配置问题还有可能在操作系统中出现，比如网络缓冲区太小，或者太多的网络连接占用了大量的系统内存。在这方面，网络接口报告的错误数量是一个最为关键的指标。如果这个数字一直在增长，则说明出现了亟待解决的硬件问题。
+
+如果硬件没有问题，那么就需要注意系统中的其他应用程序，因为它们也在消耗硬件资源，而且有可能给broker造成压力。它们可能是没有被正确安装的软件，或者是一个运行有问题的进程，比如监控代理。这个时候，可以用操作系统提供的工具（如top）来识别那些过度消耗CPU或内存的进程。
+
+### 13.3.3　broker指标
+
+__1.活跃控制器数量__
+
+活跃控制器数量指标可以告诉我们一个broker是否就是当前的集群控制器。指标的值可以是0或者1，如果是1，那么表示这个broker就是当前的控制器。在任何时候，集群都应该只有一个控制器。如果出现了两个控制器，则说明有一个本该退出的控制器线程被阻塞了。这会导致一些管理操作（比如移动分区）无法正常执行。要解决这个问题，需要重启这两个broker。当集群中出现两个控制器时，可能无法通过正常的方式安全重启broker，所以要强制关闭它们。表13-5列出了活跃控制器数量指标的详细信息。
+
+![avatar](img/33.png)
+
+如果集群中没有控制器，就无法对状态变化（比如创建主题或分区或者broker故障）做出正确的响应。这个时候，要仔细检查为什么控制器线程出现了异常。例如，ZooKeeper集群的网络分区就会导致这个问题。在解决了这些底层问题之后，最好重启所有的broker，以便重置控制器线程的状态。
+
+__2.控制器队列大小__
+
+控制器队列大小指标会告诉我们控制器当前有多少个等待处理的请求，它的值可以是0或正整数。因为新请求不断在涌入，管理操作（比如创建分区、移动分区和首领变更）也不断在发生，所以这个指标的值会频繁波动。这个指标会出现可预料的峰值，但如果持续增长，或保持在一个较高的位置不下降，则说明控制器可能被卡住了。这可能导致管理任务无法被正常执行。要解决这个问题，需要关闭当前的控制器，并将控制器角色交给另一个broker。但是，当控制器被卡住时，我们无法通过正常的方式关闭它。表13-6列出了控制器队列大小指标的详细信息。
+
+![avatar](img/34.png)
+
+__3.请求处理器空闲率__
+
+Kafka使用两个线程池来处理客户端请求：网络线程和请求处理线程（也叫 IO线程）​。网络线程负责通过网络读入数据和写出数据。这里不涉及太多的处理工作，所以不用太过担心这些线程会被耗尽。请求处理线程负责处理来自客户端的请求，包括从磁盘读取消息和向磁盘写入消息。因此，broker负载的增长对这个线程池有很大的影响。表13-7列出了请求处理器空闲率指标的详细信息。
+
+![avatar](img/35.png)
+
+请求处理器平均空闲百分比这个指标的数值越低，说明broker的负载越高。经验表明，如果空闲百分比低于20%，那么说明存在潜在的问题；如果低于10%，则说明出现了性能问题。除了集群的规模太小，还有其他两个方面的原因会导致这个线程池被重度使用。一个原因是线程池里没有足够的线程。一般来说，请求处理线程的数量应该等于系统的处理器核数（包括多线程处理器）​。
+
+另一个常见的原因是线程做了不该做的事。在Kafka 0.10之前，请求处理线程负责解压缩消息批次、验证消息、分配偏移量，并在写入磁盘之前重新压缩消息。更糟糕的是，压缩方法使用了同步锁。
+
+__4.主题流入字节__
+
+主题流入字节速率使用字节 / 秒来表示，用于度量broker从生产者客户端接收到的消息流量。可以基于这个指标决定何时对集群进行扩展或开展其他与流量增长相关的工作。这个指标也可用于评估一个broker是否比集群中的其他broker接收了更多的流量，如果出现了这种情况，则需要对分区进行再均衡。
+
+![avatar](img/36.png)
+
+因为这是我们介绍的第一个速率指标，所以有必要对它的属性进行简短的描述。所有的速率指标都有7个属性，使用哪些属性取决于你想获得哪方面的信息。有些属性是离散的事件计数，有些是基于时间段的事件平均数。务必在合适的地方使用合适的指标，否则你将得到一个错误的broker视图。
+
+- EventType：速率属性的度量单位，在这里是“字节”​。
+
+- RateUnit：速率的时间段，在这里是“秒”​。这两个属性表明，速率是通过字节 / 秒来表示的，不管它的值是基于多长时间段计算出来的平均值。速率还有其他4个不同粒度的属性。
+
+- OneMinuteRate：前1分钟的平均值。
+
+- FiveMinuteRate：前5分钟的平均值。
+
+- FifteenMinuteRate：前15分钟的平均值。
+
+- MeanRate从broker：启动到现在的平均值。
+
+除了速率属性，速率指标还有一个Count属性，它在broker启动之后就一直保持增长。Count表示从broker启动以来接收的流量的字节总数。将这个属性用在一个支持计数指标的监控系统中，就可以获得完整的度量视图（我们看到的不仅仅是平均速率）​。
+
+__5.主题流出字节__
+
+主题流出字节速率是另一个与流量增长有关的指标，与流入字节速率类似。流出字节速率也就是消费者从broker读取消息的速率。流出速率的扩展方式与流入速率不一样。这是因为Kafka支持多消费者客户端。很多Kafka集群的流出速率可以达到流入速率的6倍！这就是为什么要单独对流出速率进行观察和分析。表13-9列出了这个指标的详细信息。
+
+![avatar](img/37.png)
+
+流出速率也包含了副本的流量。也就是说，如果所有主题的复制系数都是2，那么在没有消费者客户端的情况下，流出速率等于流入速率。如果有一个消费者客户端读取了集群所有的消息，那么流出速率就是流入速率的两倍。如果不知道这一点，那么光是看这些指标你可能会感到疑惑。
+
+__6.主题流入消息__
+
+而消息速率则使用每秒生成消息条数（不考虑消息的大小）来表示流量。这也是一个很有用的生产者流量增长指标。它还可以与字节速率结合在一起使用，用于计算消息的平均大小。与字节速率一样，这个指标也能反映出集群流量是否均衡。表13-10列出了这个指标的详细信息。
+
+![avatar](img/38.png)
+
+经常会有人问，为什么没有broker的消息流出指标？这是因为在消息被读取时，broker会将整个消息批次发送给消费者，并不会展开计算每个批次包含了多少条消息。所以，broker也就不知道发送了多少条消息。broker提供了一个每秒获取请求次数指标，不过它是一种请求速率，不是消息计数。
+
+__7.分区数量__
+
+broker的分区数量就是分配给broker的分区总数，一般不会经常发生变化。它包括broker的每一个分区副本，不管是首领副本还是跟随者副本。如果一个集群启用了自动创建主题的功能，那么监控这个指标就会很有趣，因为主题的创建不受集群管理员的控制。
+
+![avatar](img/39.png)
+
+__8.首领数量__
+
+首领数量指标表示一个broker的首领分区数量。与broker的其他指标一样，这个指标也应该在整个集群的broker之间保持均衡。我们需要定期检查这个指标，并适时地发出告警，因为即使在副本的数量和大小看起来都很均衡的时候，它仍然能够显示出集群的不均衡。broker有可能会因为各种原因释放掉一个分区的领导权（比如ZooKeeper会话过期），但在会话恢复之后并不会自动收回领导权（除非启用了自动首领再均衡）​。在这些情况下，这个指标会显示较少的首领分区数，或通常为零。这时候需要进行一次首选副本选举，重新均衡集群的首领。表13-12列出了这个指标的详细信息。
+
+![avatar](img/40.png)
+
+可以将这个指标与分区数量指标结合在一起，计算出以该broker作为首领的分区的百分比。一个均衡的集群，如果它的复制系数是2，那么所有的broker都应该差不多是50%分区的首领。如果复制系数是3，则这个百分比应该降到33%。
+
+__9.离线分区数量__
+
+与非同步分区数量一样，离线分区数量也是一个关键的监控指标（参见表13-13）​。只有集群控制器会提供这个指标（其他broker提供的值为零）​，它会告诉我们集群中有多少个分区是没有首领的。以下两个原因会导致分区没有首领。
+
+● 包含这个分区副本的所有broker都关闭了。
+
+● 由于消息数量不匹配，没有同步副本能够获得领导权（并禁用了不彻底首领选举）​。
+
+![avatar](img/41.png)
+
+在生产环境中，离线分区会影响生产者客户端，导致消息丢失或应用程序回压。这属于“站点停机”问题，需要立即解决。
+
+__10.　请求指标__
+
+第6章介绍过Kafka协议，它有多种请求，每种请求都有相应的指标。截至Kafka 2.5.0，表13-14中的请求类型都有相应的指标。
+
+![avatar](img/42.png)
+
+每一种请求类型都有8个指标，它们分别提供了不同处理阶段的细节。例如，Fetch请求有如表13-15所示的指标。
+
+![avatar](img/43.png)
+
+与速率指标类似，7个时间指标分别提供了一组百分比属性和一个离散的计数属性。这些指标都是从broker启动之后累计计算得出的。broker运行的时间越长，这些指标就越稳定。它们所代表的含义如下。
+
+- 总时间:表示broker花在处理请求（从收到请求到将响应返回给请求者）上的时间。
+
+- 请求队列时间:表示请求停留在队列里（从收到请求到开始处理请求）的时间。
+
+- 本地时间:表示首领分区花在处理请求上的时间，包括把消息写入磁盘（但不一定要冲刷）​。
+
+- 远程时间:表示在请求处理完毕之前，用于等待跟随者的时间。
+
+- 节流时间:表示暂停返回响应的时间，这样做是为了降低请求者的速率，把客户端限定在配额范围内。
+
+- 响应队列时间:表示响应被发送给请求者之前停留在队列里的时间。
+
+- 响应发送时间:表示实际用于发送响应的时间。每个指标的属性如下。
+
+    - Count从broker启动到目前为止已处理的请求数量。
+    
+    - Min:所有请求的最小值。
+    
+    - Max:所有请求的最大值。
+    
+    - Mean: 所有请求的平均值。
+    
+    - StdDev:整体请求时间标准偏差。
+    
+    - Percentiles:50thPercentile、75thPercentile、95thPercentile、98thPercentile、99thPercentile、999thPercentile。
+
+### 13.3.4　主题的指标和分区的指标
+
+除了用于描述broker一般行为的指标，还有很多主题级别的指标和分区级别的指标。在较大的集群中，这样的指标很多，一般来说不太可能将它们全部收集到一个指标系统中，但在调试与客户端相关的问题时，它们会很有用。例如，主题指标可用于识别造成集群流量大量增长的主题。我们需要提供这些指标，并将它们提供给Kafka生产者和消费者。不管你是否能够定期收集这些指标，都有必要知道它们的用处。
+
+表13-16所列的指标将使用主题名称TOPICNAME和分区0作为示例。在实际当中，要把主题名称和分区ID替换成真实的主题名称和分区ID。
+
+![avatar](img/44.png)
+
+__1.个体主题指标__
+
+个体主题指标与前面介绍的broker指标非常相似。事实上，它们之间唯一的区别在于，个体主题指标指定了特定的主题名称，也就是说，这些指标属于某个特定的主题。因为个体主题指标的数量可能非常巨大（取决于集群主题的数量）​，所以我们极有可能不会监控它们或为它们设置告警。它们通常会被提供给客户端，客户端将用它们来评估和调试自己对Kafka的使用。
+
+__2.个体分区指标__
+
+个体分区指标不如个体主题指标有用。另外，它们的数量更加庞大，因为几百个主题可能包含数千个分区。不过，在某些情况下，它们还是有一定用处的，特别是用于表示分区当前在磁盘上保留的数据量（参见表13-17）的分区大小指标。如果把它们组合在一起，则可以知道主题保留了多少数据。如果同一主题的两个分区大小存在差异，则说明消息分布不均衡。日志片段数量指标表示分区保存在磁盘上的日志片段文件的数量。它可以与分区大小指标结合起来使用，用于跟踪磁盘资源的使用情况。
+
+![avatar](img/45.png)
+
+日志结束偏移量和日志起始偏移量这两个指标分别表示消息在分区中的最大偏移量和最小偏移量。然而，需要注意的是，不能用这两个指标来推算分区包含的消息数量，因为在压实日志时，具有相同键的新消息会覆盖掉旧消息，从而导致偏移量“丢失”​。
+
+### 13.3.5　Java虚拟机监控
+
+__1.垃圾回收__
+
+在JVM方面，最需要监控的是垃圾回收(GC)状态。需要监控哪些MBean取决于你使用的Java运行时(JRE)和垃圾回收器配置。如果你使用的是Oracle Java 1.8和G1垃圾回收器，那么需要监控的MBean如表13-18所示。
+
+![avatar](img/46.png)
+
+，我们需要收集CollectionCount和CollectionTime这两个属性。CollectionCount表示从JVM启动开始算起的垃圾回收次数，CollectionTime表示从JVM启动开始算起的垃圾回收时间（以毫秒为单位）​。因为这些属性都是计数值，所以它们可以告诉我们单位时间内发生垃圾回收的绝对次数和时间。还可以用它们计算出平均每次垃圾回收花费的时间，尽管这在日常运维中没有多大用处。
+
+这些指标还有一个LastGcInfo属性。这是由5个属性组成的组合值，为我们提供了最后一次垃圾回收的信息。5个属性中最重要的一个属性是duration（以毫秒为单位）​，表示最后一次垃圾回收花费了多长时间。其他几个属性（GcThreadCount、id、startTime和endTime）虽然也会提供一些信息，但用处不大。不过需要注意的是，我们无法通过这些属性查看到每一次垃圾回收的信息，因为年轻代垃圾回收发生得非常频繁。
+
+__2.Java操作系统监控__
+
+JVM通过java.lang:type=OperatingSystem这个MBean提供了有关操作系统的一些信息，但这些信息很有限，并不能告诉我们操作系统的所有情况。有两个比较有用但在操作系统层面难以收集到的属性是MaxFileDescriptorCount和OpenFileDescriptorCount。MaxFileDescriptorCount告诉我们JVM最多能打开多少个文件描述符(FD)，OpenFileDescriptorCount告诉我们目前已经打开了多少个文件描述符。每个日志片段和网络连接都需要一个文件描述符，所以它们的数量增长得很快。如果网络连接不能被正常关闭，那么broker很快就会把文件描述符耗尽。
+
+### 13.3.6　操作系统监控
+
+我们需要收集的信息包括CPU的使用情况、内存的使用情况、磁盘的使用情况、磁盘IO和网络的使用情况。
+
+按照使用类型收集到的CPU使用百分比信息也很有用。根据收集方法和操作系统的不同，我们可以得到如下这些CPU百分比细分（使用了缩写）中的一部分或全部。
+
+- us:用户空间使用的时间。
+
+- sy:内核空间使用的时间。
+
+- ni:低优先级进程使用的时间。
+
+- id:空闲时间。
+
+- wa等待（磁盘）时间。
+
+- hi:处理硬件中断的时间。
+
+- si:处理软件中断的时间。
+
+- st:等待监视器的时间。
+
+尽管很多人知道系统负载是对CPU使用情况的度量，但大多数人误解了度量的方法。平均负载是指等待处理器执行的可执行进程数。Linux系统中还有一些处于不可中断睡眠状态的进程，比如磁盘等待。负载用3个数值来表示，分别是前1分钟的平均数、前5分钟的平均数和前15分钟的平均数。在单CPU系统中，数值1表示系统负载达到了100%。此时总是会存在一个等待执行的进程。在多CPU系统中，如果负载达到100%，那么它的数值就等于CPU核数。如果系统的CPU的核数是24，那么负载达到100%时它的数值就是24。
+
+跟踪broker的CPU使用情况是很有必要的，因为它们在处理请求时占用了大量的CPU时间。内存使用情况的跟踪就显得没那么重要了，因为运行Kafka并不需要太大的内存。broker会使用堆外的一小部分内存来压缩数据，剩下的大部分会被用作缓存。尽管如此，还是要跟踪内存的使用情况，确保broker的内存不会受到其他应用程序的影响。可以通过监控总内存空间和可用交换内存空间来确保内存交换空间没有被其他应用程序占用。
+
+对Kafka来说，磁盘是最重要的子系统。所有的消息都保存在磁盘上，所以Kafka的性能很大程度上依赖于磁盘的性能。我们需要监控磁盘空间和索引节点（索引节点是Unix文件系统中文件和目录的元数据对象）​，确保磁盘空间不会被用光。对保存数据的分区来说更是如此。还需要监控磁盘IO的统计数据，它们可以告诉我们磁盘是否被有效利用。至少，我们要监控磁盘的每秒读写速度、平均读写队列大小、平均等待时间和磁盘使用百分比。最后，还需要监控broker的网络使用情况。简单地说，就是流入和流出的网络流量，一般用每秒多少位来表示。需要注意的是，在没有消费者的情况下，流入一个位就有复制系数个位流出，如果再算上消费者，那么流出流量很容易比流入流量高出一个数量级。在设置告警阈值时要切记这一点。
+
+### 13.3.7　日志
+
+有两个日志记录器，它们会分别将日志写到单独的磁盘文件中。一个是kafka.controller，我们可以将它的级别设置为INFO。这个日志记录了集群控制器的信息。在任何时候，集群中都只有一个控制器，所以只有一个broker会使用这个日志。日志中包含了主题的创建和修改操作信息、broker的状态变更信息，以及集群活动的信息，比如首选副本选举和分区移动。另一个是kafka.server.ClientQuotaManager，我们也可以将它的级别设置为INFO。这个日志用于记录与生产和消费配额活动相关的信息。因为这些信息很有用，所以最好不要把它们记录在broker的主日志文件中。
+
+在调试问题时，还有一些日志也很有用，比如kafka.request.logger，我们可以将它的级别设置为DEBUG或TRACE。这个日志包含了发送给broker的每一个请求的详细信息。如果级别被设置为DEBUG，那么它将包含连接端点、请求时间和概要信息。如果级别被设置为TRACE，那么它将包含主题和分区的信息，以及除消息体之外的所有与请求相关的信息。不管被设置成什么级别，这个日志都会产生大量的数据，所以如果不是出于调试的目的，则不建议启用这个日志。
+
+## 13.4　客户端监控
+
+### 13.4.1　生产者指标
+
+所有的生产者指标在MBean名字里都有对应的客户端ID。在下面的示例中，客户端ID用CLIENTID表示，broker ID用BROKERID表示，主题名字用TOPICNAME表示，如表13-19所示。
+
+![avatar](img/47.png)
+
+__1.生产者整体指标__
+
+生产者整体指标的属性描述了生产者各个方面的信息，从消息批次的大小到内存缓冲区的使用情况。虽然这些指标在调试时都有一定用处，但只有少数几个会经常用到，而在这几个指标当中，也只有一部分需要监控和告警。下面将讨论一些平均数指标（以 -avg结尾）​，它们都有相应的最大值（以 -max结尾）​，不过这些最大值的用处很有限。
+
+record-error-rate是一个很有必要对其设置告警的属性。这个属性的值一般情况下都是零，如果大于零，则说明生产者正在丢弃无法发送的消息。生产者配置了重试次数和回退策略，如果重试次数达到了上限，那么消息就会被丢弃。也可以跟踪另外一个属性record-retry-rate，不过这个属性不如record-error-rate重要，因为重试是很正常的行为。
+
+也可以对request-latency-avg属性设置告警。这个属性是指生产者向broker发送请求时平均花费的时间。应该为这个指标设置一个基线，并设定告警阈值。请求延迟的增加说明生产者请求速率变慢，有可能是网络出了问题，也有可能是broker出了问题。不管是哪一种原因导致的，都是性能问题，并将导致生产者应用程序出现回压和其他问题。
+
+除了这些关键指标，还需要知道生产者发送了多大的消息量。有3个属性为我们提供了3个不同的视图：outgoing-byte-rate表示每秒发送的消息字节数，record-send-rate表示每秒发送的消息数量，request-rate表示每秒生产者发送给broker的请求数。一个请求可以包含一个或多个批次，一个批次可以包含一条或多条消息，一条消息由多个字节组成。把这些指标都显示在仪表盘上会很有用。
+
+有一些指标描述了消息、请求和批次的大小（都以字节为单位）​。request-size-avg表示生产者发送给broker的请求的平均大小。batch-size-avg表示单个消息批次的平均大小（根据定义，批次包含了属于同一个分区的多条消息）​。record-size-avg表示单条消息的平均大小。对单个主题生产者来说，这些属性提供了有关消息发送的有用信息。对多主题生产者（如MirrorMaker）来说，这些属性就没有那么有用了。除了这3个指标，还有另外一个指标records-per-request-avg，它表示单个生产请求包含的平均消息条数。
+
+最后一个值得推荐的生产指标是record-queue-time-avg，它表示消息在发送给Kafka之前在生产者客户端的平均等待时间（以毫秒为单位）​。应用程序在使用生产者客户端发送消息（调用send方法）之后，生产者会等待以下任一情况发生。
+
+● 有足够多的消息填满批次（根据配置的batch.size）​。
+
+● 距离上一批次发送已经有足够长的时间（根据配置的linger.ms）​。
+
+这两种情况都会促使生产者客户端关闭当前批次，并把它发送给broker。对于较为繁忙的主题，一般会发生第一种情况；对于吞吐量较低的主题，一般会发生第二种情况。record-queue-time-avg指标会告诉我们发送消息用了多长时间，因此，如果希望通过配置上面的两个参数来降低应用程序延迟，那么这个指标会很有用。
+
+__2.个体broker指标和个体主题指标__
+
+除了生产者整体指标，还有一些MBean为每个broker连接和每个主题提供了一系列属性。这些指标在调试问题时很有用，但在平常不需要对它们进行常规的监控。这些MBean属性的名字与整体指标的名字一样，表示的含义也一样（只是它们是应用在个体broker或个体主题上）​。request-latency-avg是最为有用的个体broker指标，因为它比较稳定（在消息批次比较稳定的情况下）​，而且能够显示与某个broker之间的连接是否有问题。其他属性，比如outgoing-byte-rate和request-latency-avg，它们会因为broker所包含分区的不同而有所不同。也就是说，这些指标会随时间发生变化，完全取决于集群的状态。个体主题指标比个体broker指标要有趣一些，但它们只有在生产者向多个主题生成消息时才有用。当然，也只有在生产者不会向过多主题生成消息的情况下才有必要对这些指标进行常规的监控。例如，MirrorMaker有可能向成百上千个主题生成消息。我们无法逐个检查这些指标，也几乎不可能为它们设置合理的告警阈值。与个体broker指标一样，个体主题指标一般用于诊断问题。例如，可以根据record-send-rate和record-error-rate这两个属性将丢弃的消息隔离到特定的主题上（或者作为跨所有主题的可用消息）​。另外还有一个指标byte-rate，它表示主题整体的消息速率（以字节 / 秒表示）​。
+
+### 13.4.2　消费者指标
+
+与生产者客户端类似，消费者客户端将大量的指标属性整合到少数的几个MBean里，去掉了延迟百分位和速率移动平均数指标。因为消费者读取消息的逻辑比生产者发送消息的逻辑复杂，所以消费者的指标会更多，如表13-20所示。
+
+![avatar](img/48.png)
+
+__1.获取请求管理器指标__
+
+在消费者客户端，消费者整体指标MBean的作用并不是很大，因为有用的指标都在获取请求管理器 MBean里。消费者整体指标MBean包含了与底层网络相关的指标，而获取请求管理器MBean则包含了与字节、请求和消息速率相关的指标。与生产者客户端不同，我们可以查看消费者客户端提供的指标，但对它们设置告警并没有太大意义。对于获取请求管理器，需要监控并设置告警的一个指标是fetch-latency-avg。与生产者客户端的request-latency-avg类似，这个指标表示消费者向broker发送请求所需要的时间。为这个指标设置告警的问题在于，请求延迟是通过消费者的fetch.min.bytes和fetch.max.wait.ms这两个参数来控制的。一个低吞吐量的主题会出现不稳定的延迟，有时候broker响应很快（有可用消息）​，有时候却无法在fetch.max.wait.ms指定的时间内完成响应（没有可用消息）​。只有当主题有相对稳定和足够的消息流量时，这个指标才更有用。
+
+要想知道消费者客户端正在处理多少消息流量，可以查看bytes-consumed-rate或records-consumed-rate这两个指标，最好是两个都查看。它们分别表示客户端每秒读取的消息字节数和每秒读取的消息条数。有些用户为它们设置了最小值告警阈值，当消费者工作负载不足时，他们就会收到告警。不过需要注意的是，Kafka会试图解开消费者客户端和生产者客户端之间的耦合，但消费者读取消息的速率经常会依赖于生产者是否在正常运行，所以监控消费者的这些指标实际上是对生产者做了某些假设，这样可能会导致误报。获取请求管理器也提供了一些指标，有助于我们理解字节、消息和请求之间的关系。fetch-rate表示消费者每秒发出的请求数量，fetch-size-avg表示这些请求的平均大小（字节）​，records-per-request-avg表示每个请求的平均消息条数。需要注意的是，消费者并没有提供与生产者record-size-avg相对应的指标，所以我们无法知道消息的平均大小。如果这个对你来说很重要，那么可以用其他指标来推算，或者在应用程序接收到消息之后获取消息的大小。
+
+__2.个体broker指标和个体主题指标__
+
+与生产者客户端类似，消费者客户端也为每个broker连接和主题提供了很多指标，我们可以用它们诊断问题，但可能不需要进行常规的监控。与获取请求管理器一样，个体broker的request-latency-avg指标的用处也是有限的，具体取决于主题的消息流量。incoming-byte-rate和request-rate分别表示从个体broker每秒读取的消息字节数和每秒请求数。我们可以用它们诊断消费者与broker之间的连接问题。如果读取的是多个主题，那么消费者客户端提供的个体主题指标就会很有用，否则它们就与获取请求管理器的指标一样，我们也就没有必要去收集它们。如果客户端（如MirrorMaker）读取了大量主题，那么查看这些指标就会变得很困难。如果你真的打算收集这些指标，那么可以考虑收集最重要的3个：bytes-consumed-rate、records-consumed-rate和fetch-size-avg。bytes-consumed-rate表示从某个主题每秒读取的消息字节数，records-consumed-rate表示每秒读取的消息条数，fetch-size-avg表示每个请求的平均大小。
+
+__3.消费者协调器指标__
+
+如第4章所述，多个消费者客户端组成了消费者群组，群组中会发生一些需要协调的活动，比如新成员加入，或者通过向broker发送心跳来维持群组的成员关系。消费者协调器负责处理这些协调工作，并提供了一组指标。与其他指标一样，协调器指标也提供了很多数字，但只有一小部分需要进行常规的监控。消费者群组在执行同步操作时可能会导致消费者出现停顿。此时，群组中的消费者正在协商哪些分区应该由哪些消费者读取。停顿的时间长短取决于分区的数量。协调器提供了sync-time-avg指标，表示同步活动发生的平均时长（以毫秒为单位）​。sync-rate属性也很有用，表示消费者群组每秒发生同步的次数。在一个稳定的消费者群组中，这个数字大多数时候是零。Kafka会将消费者提交的偏移量作为读取进度的检查点。消费者既可以基于固定的时间间隔自动提交偏移量，也可以在代码中手动提交偏移量。提交偏移量也是一种生成消息的请求（它们有自己的请求类型）​，提交的偏移量会作为消息被发送到一个特定的主题上。协调器提供的commit-latency-avg属性表示提交偏移量所需的平均时长。我们也需要监控这个指标，就像监控生产者请求延迟一样。还要为它设定一个预期的基线和合理的告警阈值。协调器指标的最后一个属性是assigned-partitions，表示分配给消费者客户端（群组中的单个消费者）的分区数量。这个属性之所以有用，是因为我们可以通过比较整个群组各个消费者分配到的分区数量来判断群组的负载是否均衡。可以使用这个属性来识别因协调器分区分配算法所导致的负载不均衡问题。
+
+### 13.4.3　配额
+
+Kafka可以对客户端请求进行节流，防止某个客户端拖垮整个集群。对消费者客户端和生产者客户端来说，这都是可配的，并用每秒允许单个客户端从单个broker读取多少字节或写入多少字节来表示。它有一个broker级别的默认值，客户端可以动态覆盖。当broker发现客户端的流量已经超出配额时，它会暂缓向客户端返回响应，直到客户端流量降到配额以下。broker并不会将客户端被节流的错误码放在响应消息里。也就是说，对应用程序来说，如果不监控这些指标，就不会知道发生了节流。我们需要监控的指标如表13-21所示。
+
+![avatar](img/49.png)
+
+在默认情况下，broker不会开启配额限制。但不管有没有开启，监控这些指标总是安全无害的。况且，配额限制有可能在未来某个时刻被启用，从一开始就监控这些指标要比在后期添加更容易。
+
+## 13.5　滞后监控
+
+对消费者来说，最需要被监控的指标是滞后消息数量，也就是分区生成的最后一条消息和消费者读取的最后一条消息之间的差值。前面讲过，对于消费者滞后，使用外部监控工具比使用客户端提供的指标要好得多。虽然消费者提供了滞后指标，但该指标存在一个问题，即它只表示单个分区（也就是具有最大滞后的那个分区）的滞后，所以不能准确地告诉我们消费者的整体滞后情况。另外，它需要消费者做一些额外的操作，因为这个指标是由消费者对每个发出的获取请求进行计算得出的。如果消费者发生崩溃或离线，那么这个指标要么不准确，要么不可用。监控消费者滞后最好的办法是使用外部工具，它们既能观察broker的分区状态（通过跟踪最近生成的消息的偏移量）​，也能观察消费者的状态（通过跟踪消费者群组提交的最新偏移量）​。这种监控方式提供了一种不依赖消费者状态的客观视图。我们需要监控消费者群组读取的每一个分区。对于大型的消费者，比如MirrorMaker，这意味着需要监控成千上万个分区。
+
+第12章介绍过如何使用命令行工具获取消费者群组的信息，包括提交的偏移量和滞后的消息数量。如果直接监控由命令行工具提供的信息，那么也存在一些问题。首先，需要为每个分区定义一个合理的滞后阈值。每小时接收100条消息的主题和每秒接收10万条消息的主题的滞后阈值显然不同。其次，需要将滞后指标导入监控系统，并为它们设置告警。如果一个消费者群组读取了1500个主题，这些主题的分区数量超过了10万个，那么这将是一项令人望而生畏的任务。
+
+可以使用Burrow来降低这项任务的复杂性。Burrow是一个开源的应用程序，最初由LinkedIn开发。它会收集集群消费者群组的滞后信息，并为每个群组计算出一个独立的状态，告诉我们群组是否运行正常、是否出现了滞后、速度是否变慢或者是否已经停止工作。它不需要通过监控消费者群组的处理进度来获得阈值，不过我们仍然可以从中获得滞后的消息绝对数量。LinkedIn工程博客“Burrow:　Kafka ConsumerMonitoring Reinvented”介绍了Burrow的工作原理。Burrow既可用于监控一个集群中的消费者，也可用于监控多个集群，而且可以很容易被集成到已有的监控和告警系统中。 如果没有其他选择，则可以考虑查看消费者客户端的records-lag-max指标，它提供了消费者消费状态的部分视图。不管怎样，仍然建议使用像Burrow这样的外部监控系统。
+
+### 13.6　端到端监控
+
+我们推荐的另一种外部监控解决方案是端到端监控，它为Kafka集群的健康状态提供了一种客户端视图。消费者客户端和生产者客户端的一些指标能够说明集群可能出现了问题，但这里有猜想的成分，因为延迟的增加有可能是由客户端、网络或Kafka本身引起的。另外，你原本的任务可能只是管理Kafka集群，但现在也需要监控客户端。你需要知道下面这两个问题的答案。
+
+● 可以向Kafka集群写入消息吗？
+
+● 可以从Kafka集群读取消息吗？
+
+理想情况下，你可能希望对每一个主题都执行这些操作。但是，在大多数情况下，向每一个主题都注入人为制造的流量是不合理的。所以，可以考虑将问题提升到broker级别，而这正是Xinfra Monitor（之前叫作Kafka Monitor）要做的事情。这个工具最初由LinkedIn的Kafka团队开发并开源。它会持续地向一个横跨集群所有broker的主题生成消息，并读取这些消息。然后会监控每个broker生产请求和读取请求的可用性，以及生产消息和读取消息之间的整体延迟。这种从外部验证Kafka集群运行状态的监控方式是非常有价值的，因为与监控消费者滞后一样，broker本身无法告知客户端集群是否运行正常。
+
+# 第14章　流式处理
+
+很多基于Kafka构建的流式处理系统将Kafka作为唯一可靠的数据来源，比如Apache Storm、Apache Spark Streaming、Apache Flink、Apache Samza等。
+
+## 14.1　什么是流式处理
+
+首先，数据流是无边界数据集的抽象表示。无边界意味着无限和持续增长。无边界数据集之所以是无限的，是因为随着时间的推移，会有新记录不断加入。谷歌和亚马逊等大多数公司采用了这个定义。
+
+注意，这个简单的模型（事件流）几乎可以用来表示任何一种业务活动，比如信用卡交易、股票交易、包裹递送、流经交换机的网络事件、制造商设备传感器发出的事件、发送出去的邮件、游戏场景中的物体移动，等等。这样的例子不胜枚举，因为大部分事情可以被看成一个事件序列。除了无边界，事件流模型还有其他一些属性。
+
+__事件流是有序的__
+
+事件的发生都有先后顺序。以金融活动事件为例，先把钱存进账户，然后再把钱花掉与先把钱花掉，然后再把钱存入账户的顺序是完全不一样的。后者会出现透支，前者则不会。这是事件流与数据库表的一个区别。需要注意的是，数据库表记录的数据是无序的，SQL语句中的“order by”并不是关系模型的组成部分，它是为了方便查询数据而添加的。
+
+__不可变的数据记录__
+
+事件一旦发生，就不能被改变。一次金融交易被取消，并不是说它消失了，相反，表示前一个交易操作被取消的事件将被添加到事件流中。顾客向商店退货，之前的销售事实并不会消失，退货行为将被视为一个额外的事件。这是数据流与数据表之间的另一个区别——可以删除和修改数据表中的记录，但这些操作都是发生在数据库中的事务，也可以将这些事务当成事件记录到事件流中。如果你熟悉数据库的二进制日志(binlog)、预写式日志(WAL)或重做日志(redo log)，就应该知道，如果向数据库表插入一条记录，再将其删除，那么表中就不会包含这条记录，但重做日志中会有两个事务：插入事务和删除事务。
+
+__事件流是可重放的__
+
+这是事件流非常有价值的一个属性。我们都知道不可重放的流（流经套接字的TCP数据包通常是不可重放的）​，但对大多数业务应用程序来 说，能够重放发生在几个月前（甚至几年前）的原始事件流是非常关键的。可能是为了能够使用新的分析方法纠正过去的错误，或者是为了达到审计的目的。这也是为什么我们相信Kafka能够让现代业务领域的流式处理大获成功——Kafka可以被用来捕获和重放事件流。如果没有这项能力，那么流式处理充其量只是数据科学实验室里的一个玩具而已。
+
+需要注意的是，事件流定义和我们列出的事件流属性都没有提到事件所包含的数据和每秒事件数。不同系统的数据是不一样的，事件可以很小（有时候只有几字节）​，也可以很大（包含很多消息头的XML消息）​，它们可以是完全非结构化的键–值对，可以是半结构化的JSON，也可以是结构化的Avro消息或Protobuf消息。虽然数据流经常被视为“大数据”​，并且包含了每秒数百万个事件，但这里所讨论的技术同样适用（通常是更加适用）于小事件流，可能每秒甚至每分钟只有几个事件。
+
+现在，我们已经知道了什么是事件流，接下来是时候了解“流式处理”的真正含义了。流式处理是指实时地处理一个或多个事件流。流式处理是一种编程范式，就像请求与响应范式和批处理范式一样。下面将对这3种范式进行比较，以便更好地理解如何在软件架构中应用流式处理。
+
+__请求与响应__
+
